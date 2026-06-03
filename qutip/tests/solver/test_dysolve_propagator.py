@@ -2,16 +2,12 @@ from qutip.solver.dysolve_propagator import DysolvePropagator, dysolve_propagato
 from qutip.solver import propagator
 from qutip.solver.cy.dysolve import cy_compute_integrals
 from qutip import (
-    sigmax, sigmay, sigmaz, qeye, qeye_like, tensor, enr_destroy, CoreOptions
+    CoreOptions, sigmax, sigmay, sigmaz, qeye,
+    qeye_like, tensor, enr_destroy,
 )
 from scipy.special import factorial
 import numpy as np
 import pytest
-
-
-@pytest.fixture(scope='module')
-def empty_instance():
-    return DysolvePropagator.__new__(DysolvePropagator)
 
 
 def _enr_xx():
@@ -25,6 +21,97 @@ def _enr_xz():
 def _enr_zz():
     a, b = enr_destroy([2, 2], 1)
     return (a.dag() @ a) @ (b.dag() @ b)
+
+
+def _qobj_data(obj):
+    return obj.full()
+
+
+def test_envelope_propagator_matches_constant_amplitude_evolution():
+    dt = 0.025
+    amplitudes = np.ones(5)
+    solver = DysolvePropagator(
+        0.37 * sigmaz(),
+        0.23 * sigmax(),
+        1.7,
+        options={"max_order": 3, "max_dt": dt, "a_tol": 1e-12},
+    )
+
+    shaped = solver.envelope_propagator(amplitudes, dt)
+    constant = solver(len(amplitudes) * dt)
+
+    np.testing.assert_allclose(
+        _qobj_data(shaped), _qobj_data(constant), rtol=1e-12, atol=1e-12
+    )
+
+
+def test_envelope_propagator_real_gradient_matches_finite_difference():
+    dt = 0.02
+    amplitudes = np.array([0.7, -0.2, 0.4])
+    solver = DysolvePropagator(
+        0.31 * sigmaz(),
+        0.19 * sigmax(),
+        1.3,
+        options={"max_order": 3, "max_dt": dt, "a_tol": 1e-12},
+    )
+
+    _, gradients = solver.envelope_propagator(amplitudes, dt, gradient="real")
+    eps = 1e-6
+    for index, gradient in enumerate(gradients):
+        plus = amplitudes.copy()
+        minus = amplitudes.copy()
+        plus[index] += eps
+        minus[index] -= eps
+        finite_difference = (
+            _qobj_data(solver.envelope_propagator(plus, dt))
+            - _qobj_data(solver.envelope_propagator(minus, dt))
+        ) / (2 * eps)
+        np.testing.assert_allclose(
+            _qobj_data(gradient), finite_difference, rtol=1e-8, atol=1e-8
+        )
+
+
+def test_envelope_propagator_quadrature_gradients_match_finite_difference():
+    dt = 0.02
+    amplitudes = np.array([0.7 + 0.1j, -0.2 + 0.3j, 0.4 - 0.2j])
+    solver = DysolvePropagator(
+        0.31 * sigmaz(),
+        0.19 * sigmax(),
+        1.3,
+        options={"max_order": 3, "max_dt": dt, "a_tol": 1e-12},
+    )
+
+    _, gradients_x, gradients_y = solver.envelope_propagator(
+        amplitudes, dt, gradient="quadratures"
+    )
+    eps = 1e-6
+    for index, (gradient_x, gradient_y) in enumerate(
+        zip(gradients_x, gradients_y, strict=True)
+    ):
+        plus = amplitudes.copy()
+        minus = amplitudes.copy()
+        plus[index] += eps
+        minus[index] -= eps
+        finite_difference_x = (
+            _qobj_data(solver.envelope_propagator(plus, dt))
+            - _qobj_data(solver.envelope_propagator(minus, dt))
+        ) / (2 * eps)
+        np.testing.assert_allclose(
+            _qobj_data(gradient_x), finite_difference_x, rtol=1e-8, atol=1e-8
+        )
+
+        plus = amplitudes.copy()
+        minus = amplitudes.copy()
+        plus[index] += 1j * eps
+        minus[index] -= 1j * eps
+        finite_difference_y = (
+            _qobj_data(solver.envelope_propagator(plus, dt))
+            - _qobj_data(solver.envelope_propagator(minus, dt))
+        ) / (2 * eps)
+        np.testing.assert_allclose(
+            _qobj_data(gradient_y), finite_difference_y, rtol=1e-8, atol=1e-8
+        )
+
 
 
 @pytest.mark.parametrize("eff_omega", [-10.0, -1.0, -0.1, 0.1, 1.0, 10.0])
@@ -92,93 +179,6 @@ def test_integrals_2(eff_omega_1, eff_omega_2, dt):
     assert np.isclose(integrals, answer, rtol=1e-10, atol=1e-10)
 
 
-@pytest.mark.parametrize("max_order, X, answer", [
-    (
-        1,
-        sigmay(),
-        np.array([0, -1j, 1j, 0])
-    ),
-    (
-        2,
-        sigmay(),
-        np.array([0, 0, 1, 0, 0, 1, 0, 0])
-    ),
-    (
-        3,
-        sigmay(),
-        np.array([0, 0, 0, 0, 0, -1j, 0, 0, 0, 0, 1j, 0, 0, 0, 0, 0])
-    ),
-    (
-        1,
-        sigmax(),
-        np.array([0, 1, 1, 0])
-    ),
-    (
-        2,
-        sigmax(),
-        np.array([0, 0, 1, 0, 0, 1, 0, 0])
-    ),
-    (
-        3,
-        sigmax(),
-        np.array([0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0])
-    ),
-    (
-        1,
-        sigmaz(),
-        np.array([1, 0, 0, -1])
-    ),
-    (
-        2,
-        sigmaz(),
-        np.array([1, 0, 0, 0, 0, 0, 0, 1])
-    ),
-    (
-        3,
-        sigmaz(),
-        np.array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1])
-    ),
-    (
-        1,
-        qeye(2),
-        np.array([1, 0, 0, 1])
-    ),
-    (
-        2,
-        qeye(2),
-        np.array([1, 0, 0, 0, 0, 0, 0, 1])
-    ),
-    (
-        3,
-        qeye(2),
-        np.array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
-    ),
-    (
-        1,
-        qeye(3),
-        np.array([1, 0, 0, 0, 1, 0, 0, 0, 1])
-    ),
-    (
-        2,
-        qeye(3),
-        np.array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                  0, 0, 0, 0, 0, 0, 0, 0, 1])
-    )
-])
-def test_matrix_elements(empty_instance, max_order, X, answer):
-    dysolve = empty_instance
-    dysolve._X = X
-    # The basis shouldn't matter
-    dysolve._basis = qeye_like(X)
-    current_matrix_elements = None
-    dysolve._elems = dysolve._X.transform(dysolve._basis).full().flatten()
-
-    for _ in range(1, max_order + 1):
-        current_matrix_elements = dysolve._update_matrix_elements(
-            current_matrix_elements
-        )
-    assert np.array_equal(current_matrix_elements, answer)
-
 
 @pytest.mark.parametrize("H_0", [
     sigmaz(), sigmay(), sigmaz(), qeye(2), tensor(sigmax(), sigmaz()),
@@ -200,6 +200,48 @@ def test_zeroth_order(H_0, t_i, t_f):
 
     with CoreOptions(atol=1e-10, rtol=1e-10):
         assert U == exp
+
+
+@pytest.mark.parametrize("t_i, t_f", [
+    (0, 0.001), (0.001, 0), (-0.001, 0.001)
+])
+def test_zeroth_order_shorter_than_max_dt(t_i, t_f):
+    H_0 = tensor(sigmax(), sigmaz())
+    dysolve = DysolvePropagator(
+        H_0, qeye_like(H_0), 0,
+        options={'max_order': 0, 'max_dt': 0.1}
+    )
+    U = dysolve(t_f, t_i)
+
+    exp = (-1j*H_0*(t_f - t_i)).expm()
+
+    with CoreOptions(atol=1e-10, rtol=1e-10):
+        assert U == exp
+
+
+def test_integral_a_tol_option_is_used(monkeypatch):
+    seen_a_tols = []
+
+    def fake_compute_Sn(
+        omega_vectors, ket_bra_idx, diff_lambdas, matrix_elements,
+        dt, length, a_tol=1e-10
+    ):
+        seen_a_tols.append(a_tol)
+        return np.zeros((len(omega_vectors), length, length), dtype=complex)
+
+    monkeypatch.setitem(
+        DysolvePropagator._compute_Sns.__globals__,
+        "cy_compute_Sn",
+        fake_compute_Sn,
+    )
+    dysolve = DysolvePropagator(
+        sigmaz(), sigmax(), 1,
+        options={'max_order': 1, 'a_tol': 1e-4}
+    )
+    dysolve._compute_Sns(0.1)
+
+    assert seen_a_tols
+    assert set(seen_a_tols) == {1e-4}
 
 
 @pytest.mark.parametrize("H_0", [sigmax(), sigmay(), sigmaz()])
@@ -337,6 +379,7 @@ def test_enr_propagators_list_times(omega, ts):
     H_0 = _enr_zz()
     X = _enr_xz()
     test_4x4_propagators_list_times(H_0, X, omega, ts)
+
 
 
 @pytest.mark.parametrize("H_0, X", [

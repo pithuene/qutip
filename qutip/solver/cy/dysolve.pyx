@@ -59,6 +59,47 @@ cpdef complex cy_compute_integrals(double[:] ws, double dt, double a_tol=1e-10):
             )
 
 
+cpdef object cy_compute_Sn(
+    double[:, :] omega_vectors,
+    long[:, :] ket_bra_idx,
+    double[:, :] diff_lambdas,
+    double complex[:] matrix_elements,
+    double dt,
+    int length,
+    double a_tol=1e-10,
+):
+    """
+        Accumulate one Dyson-order tensor before order prefactors.
+
+        This moves the Python loop over frequency vectors and nonzero
+        matrix-element paths into Cython.  Matrix multiplication by exp(H0 dt)
+        is intentionally left to NumPy in the Python caller.
+    """
+    cdef Py_ssize_t n_omega = omega_vectors.shape[0]
+    cdef Py_ssize_t n_paths = diff_lambdas.shape[0]
+    cdef Py_ssize_t order = omega_vectors.shape[1]
+    cdef Py_ssize_t i, j, k
+    cdef long row, col
+    cdef object Sn_arr = np.zeros(
+        (n_omega, length, length), dtype=np.complex128
+    )
+    cdef double complex[:, :, :] Sn = Sn_arr
+    cdef object ws_arr = np.empty(order, dtype=float)
+    cdef double[:] ws = ws_arr
+
+    for i in range(n_omega):
+        for j in range(n_paths):
+            for k in range(order):
+                ws[k] = omega_vectors[i, k] + diff_lambdas[j, k]
+            row = ket_bra_idx[j, 0]
+            col = ket_bra_idx[j, 1]
+            Sn[i, row, col] += (
+                cy_compute_integrals(ws, dt, a_tol) * matrix_elements[j]
+            )
+
+    return Sn_arr
+
+
 cdef complex cy_compute_tn_integrals(double[:] ws, int n, double dt, double a_tol=1e-10):
     """
         Helper function to compute nested integrals when the function to
