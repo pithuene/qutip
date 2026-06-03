@@ -1,12 +1,56 @@
 from qutip import Qobj, qeye_like
 from .cy.dysolve import cy_compute_Sn
 from numpy.typing import ArrayLike
+from scipy.special import erf
 import numpy as np
 from numbers import Number
 import itertools
 
 
-__all__ = ['DysolvePropagator', 'dysolve_propagator']
+__all__ = ['DysolvePropagator', 'dysolve_propagator', 'gaussian_filter_matrix']
+
+
+def gaussian_filter_matrix(
+    n_pixels: int,
+    subpixels_per_pixel: int,
+    pixel_dt: float,
+    bandwidth: float,
+) -> ArrayLike:
+    """Return a Gaussian filter matrix from pixels to subpixels.
+
+    The returned matrix has shape ``(n_subpixels, n_pixels)``, where
+    ``n_subpixels = n_pixels * subpixels_per_pixel``.  Multiplying pixel
+    values by ``T.T`` gives the filtered subpixel amplitudes.  Rows are
+    normalized so a constant input envelope remains constant near the finite
+    pulse boundaries.
+    """
+    if n_pixels <= 0:
+        raise ValueError("n_pixels must be positive")
+    if subpixels_per_pixel <= 0:
+        raise ValueError("subpixels_per_pixel must be positive")
+    if pixel_dt <= 0.0:
+        raise ValueError("pixel_dt must be positive")
+    if bandwidth <= 0.0:
+        raise ValueError("bandwidth must be positive")
+
+    n_subpixels = n_pixels * subpixels_per_pixel
+    subpixel_dt = pixel_dt / subpixels_per_pixel
+    subpixel_times = (np.arange(n_subpixels, dtype=float) + 0.5) * subpixel_dt
+    pixel_starts = np.arange(n_pixels, dtype=float) * pixel_dt
+    pixel_ends = pixel_starts + pixel_dt
+    scaled_starts = 0.5 * bandwidth * (
+        subpixel_times[:, None] - pixel_starts[None, :]
+    )
+    scaled_ends = 0.5 * bandwidth * (
+        subpixel_times[:, None] - pixel_ends[None, :]
+    )
+    matrix = 0.5 * (erf(scaled_starts) - erf(scaled_ends))
+    row_sums = matrix.sum(axis=1, keepdims=True)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        matrix = np.divide(
+            matrix, row_sums, out=np.zeros_like(matrix), where=row_sums != 0.0
+        )
+    return matrix
 
 
 class DysolvePropagator:
@@ -52,11 +96,16 @@ class DysolvePropagator:
 
     Notes
     -----
-    The system's hamiltonian must be of the form
-    H = H_0 + cos(omega*t)X for Dysolve to work.
+    The standard propagator methods support Hamiltonians of the form
+    ``H = H_0 + sum_m cos(omega_m*t) X_m``.  Use
+    :meth:`from_drives` for multiple drive terms.  Piecewise-constant real or
+    complex envelopes are supported by :meth:`envelope_propagator`, where
+    complex amplitudes represent I/Q quadratures.  Gaussian-filtered optimizer
+    pixels are supported by :meth:`filtered_envelope_propagator`.
 
-    For the moment, only a cosine perturbation is allowed. Dysolve can
-    manage more exotic perturbations, but this is not implemented yet.
+    More general perturbations described in the Dysolve paper, such as
+    arbitrary modulation functions or linear interpolation within subpixels,
+    are not implemented.
 
     .. note:: Experimental.
 
@@ -69,12 +118,43 @@ class DysolvePropagator:
         omega: float,
         options: dict[str] = None,
     ):
+        self._initialize(H_0, [(X, omega)], options)
+
+    @classmethod
+    def from_drives(
+        cls,
+        H_0: Qobj,
+        drives,
+        options: dict[str] = None,
+    ):
+        """Create a Dysolve propagator with multiple drive terms.
+
+        ``drives`` is an iterable of ``(X, omega)`` pairs.  The represented
+        Hamiltonian is ``H0 + sum_m X_m cos(omega_m t)`` for the standard
+        propagator methods.  Complex envelopes in :meth:`envelope_propagator`
+        provide independent I/Q quadratures for each drive.
+        """
+        obj = cls.__new__(cls)
+        obj._initialize(H_0, drives, options)
+        return obj
+
+    def _initialize(self, H_0: Qobj, drives, options: dict[str] = None):
+        drives = tuple(drives)
+        if len(drives) == 0:
+            raise ValueError("at least one drive must be supplied")
+
         # System
         self._eigenenergies, self._basis = H_0.eigenstates()
         self._H_0 = H_0.transform(self._basis)
-        self._X = X.transform(self._basis)
-        self._elems = self._X.full().flatten()
-        self._omega = omega
+        self._Xs = tuple(X.transform(self._basis) for X, _ in drives)
+        self._omegas = np.asarray([omega for _, omega in drives], dtype=float)
+        self._n_drives = len(self._Xs)
+
+        # Backward-compatible single-drive attributes.
+        self._X = self._Xs[0]
+        self._omega = float(self._omegas[0])
+        self._elems_by_drive = tuple(X.full().flatten() for X in self._Xs)
+        self._elems = self._elems_by_drive[0]
 
         # Options
         if options is None:
@@ -95,6 +175,8 @@ class DysolvePropagator:
         self._dt_Sns = {}
         self._omega_vectors = {}
         self._omega_sums = {}
+        self._branch_drive_indices = {}
+        self._branch_signs = {}
         self._matrix_element_paths = {}
 
         # Time propagator
@@ -226,20 +308,48 @@ class DysolvePropagator:
 
         return Us
 
-    def _get_omega_vectors(self, n: int) -> ArrayLike:
+    def _get_branch_metadata(self, n: int) -> tuple[ArrayLike, ArrayLike, ArrayLike]:
         """
-        Get all frequency sign combinations for a Dyson order.
+        Get drive indices, signs and frequencies for a Dyson order.
+
+        The branch slots are ordered from the rightmost time-ordered integral
+        to the leftmost one, matching the convention used by
+        ``cy_compute_integrals``.
         """
         if n not in self._omega_vectors:
-            self._omega_vectors[n] = np.fromiter(
-                itertools.product([self._omega, -self._omega], repeat=n),
-                np.dtype((float, (n,)))
+            alphabet = [
+                (drive_index, sign, sign * self._omegas[drive_index])
+                for drive_index in range(self._n_drives)
+                for sign in (1, -1)
+            ]
+            branches = tuple(itertools.product(alphabet, repeat=n))
+            self._branch_drive_indices[n] = np.asarray(
+                [[entry[0] for entry in branch] for branch in branches],
+                dtype=np.int_,
             )
-        return self._omega_vectors[n]
+            self._branch_signs[n] = np.asarray(
+                [[entry[1] for entry in branch] for branch in branches],
+                dtype=np.int_,
+            )
+            self._omega_vectors[n] = np.asarray(
+                [[entry[2] for entry in branch] for branch in branches],
+                dtype=float,
+            )
+        return (
+            self._branch_drive_indices[n],
+            self._branch_signs[n],
+            self._omega_vectors[n],
+        )
+
+    def _get_omega_vectors(self, n: int) -> ArrayLike:
+        """
+        Get all drive-frequency sign combinations for a Dyson order.
+        """
+        return self._get_branch_metadata(n)[2]
 
     def _get_omega_sums(self, n: int) -> ArrayLike:
         """
-        Get sums of all frequency sign combinations for a Dyson order.
+        Get sums of all drive-frequency sign combinations for a Dyson order.
         """
         if n not in self._omega_sums:
             self._omega_sums[n] = np.ascontiguousarray(
@@ -247,28 +357,32 @@ class DysolvePropagator:
             )
         return self._omega_sums[n]
 
-    def _get_matrix_element_paths(self, n: int) -> tuple[ArrayLike, ArrayLike]:
+    def _get_matrix_element_paths(
+        self, drive_indices: tuple[int, ...]
+    ) -> tuple[ArrayLike, ArrayLike]:
         """
-        Get nonzero matrix-element paths for a Dyson order.
+        Get nonzero matrix-element paths for an ordered drive sequence.
 
-        For an order ``n`` path ``[k_n, ..., k_0]``, the stored value is
-        ``X[k_n, k_{n-1}] * ... * X[k_1, k_0]``.  Paths with a zero product
-        never contribute to the Dyson operators, so pruning them avoids the
-        ``N ** (n + 1)`` all-path loop for sparse drive operators.
+        ``drive_indices`` is ordered from the rightmost Dyson integral to the
+        leftmost one.  For an order ``n`` path ``[k_n, ..., k_0]``, the stored
+        value is ``X_left[k_n, k_{n-1}] * ... * X_right[k_1, k_0]``.
         """
-        if n in self._matrix_element_paths:
-            return self._matrix_element_paths[n]
+        drive_indices = tuple(int(index) for index in drive_indices)
+        if drive_indices in self._matrix_element_paths:
+            return self._matrix_element_paths[drive_indices]
 
-        length = self._X.shape[0]
-        rows, cols = np.nonzero(self._elems.reshape(length, length))
-        values = self._elems.reshape(length, length)[rows, cols]
+        length = self._Xs[0].shape[0]
+        drive = drive_indices[-1]
+        elems = self._elems_by_drive[drive].reshape(length, length)
+        rows, cols = np.nonzero(elems)
+        values = elems[rows, cols]
 
-        if n == 1:
+        if len(drive_indices) == 1:
             paths = np.column_stack((rows, cols)).astype(np.int64)
-            path_values = values
+            path_values = values.astype(np.complex128, copy=False)
         else:
             previous_paths, previous_values = self._get_matrix_element_paths(
-                n - 1
+                drive_indices[:-1]
             )
             paths = []
             path_values = []
@@ -287,10 +401,10 @@ class DysolvePropagator:
                 paths = np.vstack(paths)
                 path_values = np.concatenate(path_values)
             else:
-                paths = np.empty((0, n + 1), dtype=np.int64)
+                paths = np.empty((0, len(drive_indices) + 1), dtype=np.int64)
                 path_values = np.empty(0, dtype=np.complex128)
 
-        self._matrix_element_paths[n] = (paths, path_values)
+        self._matrix_element_paths[drive_indices] = (paths, path_values)
         return paths, path_values
 
     def _dt_cache_key(self, dt: float) -> float:
@@ -306,7 +420,7 @@ class DysolvePropagator:
 
     def _compute_Sns(self, dt: float) -> dict:
         """
-        Computes Sns for each omega vector. This implements a similar equation
+        Computes Sns for each branch vector. This implements a similar equation
         to eq. (14) in Ref, but the function "f" is not used to avoid dealing
         explicitly with limits.
 
@@ -318,32 +432,39 @@ class DysolvePropagator:
         Returns
         -------
         Sns : dict
-            Sns for each omega vector. key = order with the result for each
-            omega vector.
-
+            Sns for each branch vector, keyed by Dyson order.
         """
         dt_key = self._dt_cache_key(dt)
         if dt_key in self._dt_Sns:
             return self._dt_Sns[dt_key]
 
-        else:
-            dt = dt_key
-            Sns = {}
-            length = len(self._eigenenergies)
-            exp_H_0 = (-1j*dt*self._H_0).expm().full()
-            eigenenergies = np.asarray(self._eigenenergies)
+        dt = dt_key
+        Sns = {}
+        length = len(self._eigenenergies)
+        exp_H_0 = (-1j*dt*self._H_0).expm().full()
+        eigenenergies = np.asarray(self._eigenenergies)
 
-            Sns[0] = exp_H_0
+        Sns[0] = exp_H_0
 
-            for n in range(1, self.max_order + 1):
-                omega_vectors = self._get_omega_vectors(n)
-                paths, matrix_elements = self._get_matrix_element_paths(n)
+        for n in range(1, self.max_order + 1):
+            drive_indices, _, omega_vectors = self._get_branch_metadata(n)
+            Sn = np.zeros(
+                (len(omega_vectors), length, length), dtype=np.complex128
+            )
+            unique_drive_indices = np.unique(drive_indices, axis=0)
+            for drive_sequence in unique_drive_indices:
+                mask = np.all(drive_indices == drive_sequence[None, :], axis=1)
+                paths, matrix_elements = self._get_matrix_element_paths(
+                    tuple(drive_sequence)
+                )
+                if len(paths) == 0:
+                    continue
                 path_energies = eigenenergies[paths]
                 diff_lambdas = -np.diff(path_energies)[:, ::-1]
                 ket_bra_idx = paths[:, [0, -1]]
 
-                Sn = cy_compute_Sn(
-                    np.ascontiguousarray(omega_vectors, dtype=float),
+                Sn_group = cy_compute_Sn(
+                    np.ascontiguousarray(omega_vectors[mask], dtype=float),
                     np.ascontiguousarray(ket_bra_idx, dtype=np.int_),
                     np.ascontiguousarray(diff_lambdas, dtype=float),
                     np.ascontiguousarray(matrix_elements, dtype=np.complex128),
@@ -351,13 +472,37 @@ class DysolvePropagator:
                     length,
                     self.a_tol,
                 )
-                Sn *= (-1j / 2) ** n
-                Sn = exp_H_0 @ Sn
+                Sn_group *= (-1j / 2) ** n
+                Sn[mask] = exp_H_0 @ Sn_group
 
-                Sns[n] = Sn
+            Sns[n] = Sn
 
-            self._dt_Sns[dt_key] = Sns
-            return Sns
+        self._dt_Sns[dt_key] = Sns
+        return Sns
+
+    def _as_drive_amplitudes(self, amplitudes: ArrayLike) -> ArrayLike:
+        """Return amplitudes as an ``(n_drives, n_subpixels)`` array."""
+        amplitudes = np.asarray(amplitudes)
+        if amplitudes.ndim == 1 and self._n_drives == 1:
+            amplitudes = amplitudes[None, :]
+        elif amplitudes.ndim != 2:
+            raise ValueError(
+                "amplitudes must be one-dimensional for one drive or "
+                "two-dimensional with shape (n_drives, n_subpixels)"
+            )
+        if amplitudes.shape[0] != self._n_drives:
+            raise ValueError(
+                "amplitudes first dimension must match the number of drives"
+            )
+        if amplitudes.shape[1] == 0:
+            raise ValueError("amplitudes must contain at least one subpixel")
+        return amplitudes
+
+    def _format_drive_gradients(self, gradients):
+        """Preserve the single-drive gradient return format."""
+        if self._n_drives == 1:
+            return tuple(gradients[0])
+        return tuple(tuple(drive_gradients) for drive_gradients in gradients)
 
     def _envelope_branch_factors(
         self,
@@ -369,62 +514,62 @@ class DysolvePropagator:
         """
         Return branch amplitude factors for a piecewise-constant envelope.
 
-        ``amplitudes`` may be real, for a cosine envelope, or complex.  A
-        complex amplitude ``a = x + 1j*y`` represents the real drive
-        ``x*cos(omega*t) + y*sin(omega*t)`` multiplying ``X``.  Since the
-        prepared Dyson tensors already include the ``1/2`` factors from the
-        cosine decomposition, each positive-frequency branch is weighted by
-        ``conj(a)`` and each negative-frequency branch by ``a``.
+        ``amplitudes`` has shape ``(n_drives, n_subpixels)``.  A complex
+        amplitude ``a = x + 1j*y`` represents the real drive
+        ``x*cos(omega*t) + y*sin(omega*t)`` multiplying that drive's operator.
+        Since the prepared Dyson tensors already include the ``1/2`` factors
+        from the cosine decomposition, each positive-frequency branch is
+        weighted by ``conj(a)`` and each negative-frequency branch by ``a``.
         """
         amplitudes = np.asarray(amplitudes)
-        omega_vectors = self._get_omega_vectors(n)
-        n_positive = np.count_nonzero(
-            np.isclose(omega_vectors, self._omega), axis=1
-        )
-        n_negative = n - n_positive
+        drive_indices, signs, _ = self._get_branch_metadata(n)
+        n_subpixels = amplitudes.shape[1]
+        n_branches = drive_indices.shape[0]
 
-        plus = np.conjugate(amplitudes)[:, None]
-        minus = amplitudes[:, None]
-        factors = plus ** n_positive[None, :] * minus ** n_negative[None, :]
+        factors = np.ones((n_subpixels, n_branches), dtype=np.result_type(amplitudes, complex))
+        values_by_position = []
+        for position in range(n):
+            values = np.empty_like(factors)
+            for drive_index in range(self._n_drives):
+                drive_mask = drive_indices[:, position] == drive_index
+                if not np.any(drive_mask):
+                    continue
+                positive = drive_mask & (signs[:, position] > 0)
+                negative = drive_mask & (signs[:, position] < 0)
+                if np.any(positive):
+                    values[:, positive] = np.conjugate(amplitudes[drive_index])[:, None]
+                if np.any(negative):
+                    values[:, negative] = amplitudes[drive_index, :, None]
+            values_by_position.append(values)
+            factors *= values
+
         if not gradient:
             return factors
 
-        d_plus_dx = np.ones_like(plus)
-        d_minus_dx = np.ones_like(minus)
-        d_plus_dy = -1j * np.ones_like(plus)
-        d_minus_dy = 1j * np.ones_like(minus)
-
-        with np.errstate(divide='ignore', invalid='ignore'):
-            d_dx = np.zeros_like(factors, dtype=np.result_type(factors, complex))
-            d_dy = np.zeros_like(d_dx)
-            pos_mask = n_positive > 0
-            neg_mask = n_negative > 0
-            if np.any(pos_mask):
-                d_dx[:, pos_mask] += (
-                    n_positive[pos_mask][None, :]
-                    * plus ** (n_positive[pos_mask][None, :] - 1)
-                    * minus ** n_negative[pos_mask][None, :]
-                    * d_plus_dx
-                )
-                d_dy[:, pos_mask] += (
-                    n_positive[pos_mask][None, :]
-                    * plus ** (n_positive[pos_mask][None, :] - 1)
-                    * minus ** n_negative[pos_mask][None, :]
-                    * d_plus_dy
-                )
-            if np.any(neg_mask):
-                d_dx[:, neg_mask] += (
-                    n_negative[neg_mask][None, :]
-                    * plus ** n_positive[neg_mask][None, :]
-                    * minus ** (n_negative[neg_mask][None, :] - 1)
-                    * d_minus_dx
-                )
-                d_dy[:, neg_mask] += (
-                    n_negative[neg_mask][None, :]
-                    * plus ** n_positive[neg_mask][None, :]
-                    * minus ** (n_negative[neg_mask][None, :] - 1)
-                    * d_minus_dy
-                )
+        d_dx = np.zeros(
+            (self._n_drives, n_subpixels, n_branches),
+            dtype=np.result_type(amplitudes, complex),
+        )
+        d_dy = np.zeros_like(d_dx)
+        for position in range(n):
+            product_except = np.ones_like(factors)
+            for other_position, values in enumerate(values_by_position):
+                if other_position != position:
+                    product_except *= values
+            for drive_index in range(self._n_drives):
+                drive_mask = drive_indices[:, position] == drive_index
+                if not np.any(drive_mask):
+                    continue
+                positive = drive_mask & (signs[:, position] > 0)
+                negative = drive_mask & (signs[:, position] < 0)
+                if np.any(positive):
+                    branch_indices = np.nonzero(positive)[0]
+                    d_dx[drive_index][:, branch_indices] += product_except[:, branch_indices]
+                    d_dy[drive_index][:, branch_indices] += -1j * product_except[:, branch_indices]
+                if np.any(negative):
+                    branch_indices = np.nonzero(negative)[0]
+                    d_dx[drive_index][:, branch_indices] += product_except[:, branch_indices]
+                    d_dy[drive_index][:, branch_indices] += 1j * product_except[:, branch_indices]
         return factors, d_dx, d_dy
 
     def _compute_envelope_subprops(
@@ -438,21 +583,20 @@ class DysolvePropagator:
         """
         Compute all subpixel propagators for a shaped envelope.
         """
-        amplitudes = np.asarray(amplitudes)
-        if amplitudes.ndim != 1:
-            raise ValueError("amplitudes must be a one-dimensional array")
-        if len(amplitudes) == 0:
-            raise ValueError("amplitudes must contain at least one value")
+        amplitudes = self._as_drive_amplitudes(amplitudes)
+        n_subpixels = amplitudes.shape[1]
 
-        current_times = t0 + np.arange(len(amplitudes), dtype=float) * dt
+        current_times = t0 + np.arange(n_subpixels, dtype=float) * dt
         Sns = self._compute_Sns(dt)
         length = len(self._eigenenergies)
         subpropagators = np.broadcast_to(
-            Sns[0], (len(amplitudes), length, length)
+            Sns[0], (n_subpixels, length, length)
         ).astype(np.complex128, copy=True)
         if gradient:
-            dsubprops_dx = np.zeros_like(subpropagators)
-            dsubprops_dy = np.zeros_like(subpropagators)
+            dsubprops_dx = np.zeros(
+                (self._n_drives, n_subpixels, length, length), dtype=np.complex128
+            )
+            dsubprops_dy = np.zeros_like(dsubprops_dx)
 
         for n in range(1, self.max_order + 1):
             omega_sums = self._get_omega_sums(n)
@@ -461,12 +605,13 @@ class DysolvePropagator:
                 amp_factors, d_amp_dx, d_amp_dy = self._envelope_branch_factors(
                     amplitudes, n, gradient=True
                 )
-                dsubprops_dx += np.tensordot(
-                    phases * d_amp_dx, Sns[n], axes=(1, 0)
-                )
-                dsubprops_dy += np.tensordot(
-                    phases * d_amp_dy, Sns[n], axes=(1, 0)
-                )
+                for drive_index in range(self._n_drives):
+                    dsubprops_dx[drive_index] += np.tensordot(
+                        phases * d_amp_dx[drive_index], Sns[n], axes=(1, 0)
+                    )
+                    dsubprops_dy[drive_index] += np.tensordot(
+                        phases * d_amp_dy[drive_index], Sns[n], axes=(1, 0)
+                    )
             else:
                 amp_factors = self._envelope_branch_factors(amplitudes, n)
             subpropagators += np.tensordot(
@@ -486,20 +631,18 @@ class DysolvePropagator:
         gradient: bool | str = False,
     ):
         """
-        Propagator for a piecewise-constant shaped drive envelope.
+        Propagator for piecewise-constant shaped drive envelopes.
 
-        The Hamiltonian represented by this method is
-        ``H = H0 + X * (x_l*cos(omega*t) + y_l*sin(omega*t))`` during the
-        subpixel ``l``, where ``amplitudes[l] = x_l + 1j*y_l``.  Real
-        amplitudes therefore produce a shaped cosine drive.  The operator
-        ``X`` passed to :class:`DysolvePropagator` should be the drive
-        operator per unit envelope amplitude.
+        For one drive, ``amplitudes`` may be one-dimensional.  For multiple
+        drives, it must have shape ``(n_drives, n_subpixels)``.  The Hamiltonian
+        represented by this method is
+        ``H = H0 + sum_m X_m * (x_m,l*cos(omega_m*t) + y_m,l*sin(omega_m*t))``
+        during subpixel ``l``, where ``amplitudes[m, l] = x_m,l + 1j*y_m,l``.
 
         If ``gradient`` is false, return ``U(T, t0)`` as a ``Qobj``.  If
-        ``gradient='real'``, also return a tuple of derivatives with respect
-        to the real cosine amplitudes.  If ``gradient='quadratures'``, return
-        derivatives with respect to the real and imaginary quadratures as
-        ``(U, dU_dx, dU_dy)``.
+        ``gradient='real'``, also return derivatives with respect to the real
+        cosine amplitudes.  If ``gradient='quadratures'``, return derivatives
+        with respect to the real and imaginary quadratures.
         """
         if gradient not in (False, 'real', 'quadratures'):
             raise ValueError(
@@ -526,28 +669,118 @@ class DysolvePropagator:
             return U
 
         suffix = np.eye(length, dtype=np.complex128)
-        dU_dx = [None] * len(subprops)
-        dU_dy = [None] * len(subprops)
-        for index in range(len(subprops) - 1, -1, -1):
-            dU_dx[index] = suffix @ dsubprops_dx[index] @ prefixes[index]
-            dU_dy[index] = suffix @ dsubprops_dy[index] @ prefixes[index]
+        n_subpixels = len(subprops)
+        dU_dx = [[None] * n_subpixels for _ in range(self._n_drives)]
+        dU_dy = [[None] * n_subpixels for _ in range(self._n_drives)]
+        for index in range(n_subpixels - 1, -1, -1):
+            for drive_index in range(self._n_drives):
+                dU_dx[drive_index][index] = (
+                    suffix @ dsubprops_dx[drive_index, index] @ prefixes[index]
+                )
+                dU_dy[drive_index][index] = (
+                    suffix @ dsubprops_dy[drive_index, index] @ prefixes[index]
+                )
             suffix = suffix @ subprops[index]
 
-        dU_dx = tuple(
-            Qobj(dU, self._H_0._dims, copy=False).transform(
-                self._basis, True
+        for drive_index in range(self._n_drives):
+            dU_dx[drive_index] = tuple(
+                Qobj(dU, self._H_0._dims, copy=False).transform(
+                    self._basis, True
+                )
+                for dU in dU_dx[drive_index]
             )
-            for dU in dU_dx
-        )
-        dU_dy = tuple(
-            Qobj(dU, self._H_0._dims, copy=False).transform(
-                self._basis, True
+            dU_dy[drive_index] = tuple(
+                Qobj(dU, self._H_0._dims, copy=False).transform(
+                    self._basis, True
+                )
+                for dU in dU_dy[drive_index]
             )
-            for dU in dU_dy
-        )
+        dU_dx = self._format_drive_gradients(dU_dx)
+        dU_dy = self._format_drive_gradients(dU_dy)
         if gradient == 'real':
             return U, dU_dx
         return U, dU_dx, dU_dy
+
+    def filtered_envelope_propagator(
+        self,
+        pixels: ArrayLike,
+        pixel_dt: float,
+        subpixels_per_pixel: int,
+        bandwidth: float,
+        t0: float = 0.0,
+        *,
+        gradient: bool | str = False,
+    ):
+        """Propagator for Gaussian-filtered optimizer pixels.
+
+        ``pixels`` follows the same drive-axis convention as
+        :meth:`envelope_propagator`, but indexes optimizer pixels instead of
+        delivered subpixels.  A Gaussian filter maps pixels to subpixels before
+        propagation.  Requested gradients are returned with respect to the
+        unfiltered optimizer pixels.
+        """
+        if gradient not in (False, 'real', 'quadratures'):
+            raise ValueError(
+                "gradient must be False, 'real', or 'quadratures'"
+            )
+        pixels = self._as_drive_amplitudes(pixels)
+        n_pixels = pixels.shape[1]
+        filter_matrix = gaussian_filter_matrix(
+            n_pixels, subpixels_per_pixel, pixel_dt, bandwidth
+        )
+        subpixel_dt = pixel_dt / subpixels_per_pixel
+        subpixels = pixels @ filter_matrix.T
+        if not gradient:
+            return self.envelope_propagator(subpixels, subpixel_dt, t0)
+
+        if gradient == 'real':
+            U, dU_ds = self.envelope_propagator(
+                subpixels, subpixel_dt, t0, gradient='real'
+            )
+            dU_ds = (dU_ds,) if self._n_drives == 1 else dU_ds
+            dU_du = []
+            for drive_index in range(self._n_drives):
+                drive_gradients = []
+                for pixel_index in range(n_pixels):
+                    gradient_sum = sum(
+                        filter_matrix[subpixel_index, pixel_index]
+                        * dU_ds[drive_index][subpixel_index]
+                        for subpixel_index in range(filter_matrix.shape[0])
+                    )
+                    drive_gradients.append(gradient_sum)
+                dU_du.append(tuple(drive_gradients))
+            return U, self._format_drive_gradients(dU_du)
+
+        U, dU_dx_ds, dU_dy_ds = self.envelope_propagator(
+            subpixels, subpixel_dt, t0, gradient='quadratures'
+        )
+        dU_dx_ds = (dU_dx_ds,) if self._n_drives == 1 else dU_dx_ds
+        dU_dy_ds = (dU_dy_ds,) if self._n_drives == 1 else dU_dy_ds
+        dU_dx_du = []
+        dU_dy_du = []
+        for drive_index in range(self._n_drives):
+            drive_gradients_x = []
+            drive_gradients_y = []
+            for pixel_index in range(n_pixels):
+                gradient_sum_x = sum(
+                    filter_matrix[subpixel_index, pixel_index]
+                    * dU_dx_ds[drive_index][subpixel_index]
+                    for subpixel_index in range(filter_matrix.shape[0])
+                )
+                gradient_sum_y = sum(
+                    filter_matrix[subpixel_index, pixel_index]
+                    * dU_dy_ds[drive_index][subpixel_index]
+                    for subpixel_index in range(filter_matrix.shape[0])
+                )
+                drive_gradients_x.append(gradient_sum_x)
+                drive_gradients_y.append(gradient_sum_y)
+            dU_dx_du.append(tuple(drive_gradients_x))
+            dU_dy_du.append(tuple(drive_gradients_y))
+        return (
+            U,
+            self._format_drive_gradients(dU_dx_du),
+            self._format_drive_gradients(dU_dy_du),
+        )
 
     def _compute_interval(
         self,
@@ -679,11 +912,9 @@ def dysolve_propagator(
 
     Notes
     -----
-    The system's hamiltonian must be of the form
-    H = H_0 + cos(omega*t)X for Dysolve to work.
-
-    For the moment, only a cosine perturbation is allowed. Dysolve can
-    manage more exotic perturbations, but this is not implemented yet.
+    This helper supports the single-drive Hamiltonian
+    ``H = H_0 + cos(omega*t) X``.  For multiple drive terms or shaped
+    envelopes, instantiate :class:`DysolvePropagator` directly.
 
     .. note:: Experimental.
 

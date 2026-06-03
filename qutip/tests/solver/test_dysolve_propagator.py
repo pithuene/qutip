@@ -1,4 +1,8 @@
-from qutip.solver.dysolve_propagator import DysolvePropagator, dysolve_propagator
+from qutip.solver.dysolve_propagator import (
+    DysolvePropagator,
+    dysolve_propagator,
+    gaussian_filter_matrix,
+)
 from qutip.solver import propagator
 from qutip.solver.cy.dysolve import cy_compute_integrals
 from qutip import (
@@ -112,6 +116,201 @@ def test_envelope_propagator_quadrature_gradients_match_finite_difference():
             _qobj_data(gradient_y), finite_difference_y, rtol=1e-8, atol=1e-8
         )
 
+
+
+def test_multi_drive_propagator_matches_qutip_propagator():
+    H_0 = 0.37 * sigmaz()
+    X_0 = 0.11 * sigmax()
+    X_1 = 0.07 * sigmay()
+    omega_0 = 1.3
+    omega_1 = 2.1
+    t = 0.12
+    solver = DysolvePropagator.from_drives(
+        H_0,
+        [(X_0, omega_0), (X_1, omega_1)],
+        options={"max_order": 4, "max_dt": 0.02, "a_tol": 1e-12},
+    )
+
+    dysolve_U = solver(t)
+
+    def coeff_0(t, omega_0):
+        return np.cos(omega_0 * t)
+
+    def coeff_1(t, omega_1):
+        return np.cos(omega_1 * t)
+
+    qutip_U = propagator(
+        [H_0, [X_0, coeff_0], [X_1, coeff_1]],
+        t,
+        args={"omega_0": omega_0, "omega_1": omega_1},
+        options={"atol": 1e-11, "rtol": 1e-10},
+    )
+    np.testing.assert_allclose(
+        _qobj_data(dysolve_U), _qobj_data(qutip_U), rtol=1e-5, atol=1e-7
+    )
+
+
+def test_multi_drive_envelope_gradients_match_finite_difference():
+    dt = 0.015
+    amplitudes = np.array(
+        [[0.7 + 0.1j, -0.2 + 0.3j], [0.4 - 0.2j, 0.1 + 0.5j]]
+    )
+    solver = DysolvePropagator.from_drives(
+        0.31 * sigmaz(),
+        [(0.19 * sigmax(), 1.3), (0.13 * sigmay(), 1.9)],
+        options={"max_order": 3, "max_dt": dt, "a_tol": 1e-12},
+    )
+
+    _, gradients_x, gradients_y = solver.envelope_propagator(
+        amplitudes, dt, gradient="quadratures"
+    )
+    eps = 1e-6
+    for drive_index, pixel_index in [(0, 1), (1, 0)]:
+        plus = amplitudes.copy()
+        minus = amplitudes.copy()
+        plus[drive_index, pixel_index] += eps
+        minus[drive_index, pixel_index] -= eps
+        finite_difference_x = (
+            _qobj_data(solver.envelope_propagator(plus, dt))
+            - _qobj_data(solver.envelope_propagator(minus, dt))
+        ) / (2 * eps)
+        np.testing.assert_allclose(
+            _qobj_data(gradients_x[drive_index][pixel_index]),
+            finite_difference_x,
+            rtol=1e-8,
+            atol=1e-8,
+        )
+
+        plus = amplitudes.copy()
+        minus = amplitudes.copy()
+        plus[drive_index, pixel_index] += 1j * eps
+        minus[drive_index, pixel_index] -= 1j * eps
+        finite_difference_y = (
+            _qobj_data(solver.envelope_propagator(plus, dt))
+            - _qobj_data(solver.envelope_propagator(minus, dt))
+        ) / (2 * eps)
+        np.testing.assert_allclose(
+            _qobj_data(gradients_y[drive_index][pixel_index]),
+            finite_difference_y,
+            rtol=1e-8,
+            atol=1e-8,
+        )
+
+
+def test_gaussian_filter_matrix_preserves_constant_envelope():
+    matrix = gaussian_filter_matrix(
+        n_pixels=4,
+        subpixels_per_pixel=3,
+        pixel_dt=0.2,
+        bandwidth=20.0,
+    )
+    assert matrix.shape == (12, 4)
+    np.testing.assert_allclose(matrix.sum(axis=1), 1.0, rtol=1e-14, atol=1e-14)
+    np.testing.assert_allclose(matrix @ np.ones(4), np.ones(12))
+
+
+def test_filtered_envelope_gradient_matches_finite_difference():
+    pixels = np.array([0.7 + 0.1j, -0.2 + 0.3j, 0.4 - 0.2j])
+    pixel_dt = 0.02
+    solver = DysolvePropagator(
+        0.31 * sigmaz(),
+        0.19 * sigmax(),
+        1.3,
+        options={"max_order": 3, "max_dt": pixel_dt / 2, "a_tol": 1e-12},
+    )
+
+    _, gradients_x, gradients_y = solver.filtered_envelope_propagator(
+        pixels,
+        pixel_dt,
+        subpixels_per_pixel=2,
+        bandwidth=80.0,
+        gradient="quadratures",
+    )
+    eps = 1e-6
+    index = 1
+    plus = pixels.copy(); plus[index] += eps
+    minus = pixels.copy(); minus[index] -= eps
+    finite_difference_x = (
+        _qobj_data(
+            solver.filtered_envelope_propagator(
+                plus, pixel_dt, 2, 80.0
+            )
+        )
+        - _qobj_data(
+            solver.filtered_envelope_propagator(
+                minus, pixel_dt, 2, 80.0
+            )
+        )
+    ) / (2 * eps)
+    np.testing.assert_allclose(
+        _qobj_data(gradients_x[index]), finite_difference_x, rtol=1e-8, atol=1e-8
+    )
+
+    plus = pixels.copy(); plus[index] += 1j * eps
+    minus = pixels.copy(); minus[index] -= 1j * eps
+    finite_difference_y = (
+        _qobj_data(
+            solver.filtered_envelope_propagator(
+                plus, pixel_dt, 2, 80.0
+            )
+        )
+        - _qobj_data(
+            solver.filtered_envelope_propagator(
+                minus, pixel_dt, 2, 80.0
+            )
+        )
+    ) / (2 * eps)
+    np.testing.assert_allclose(
+        _qobj_data(gradients_y[index]), finite_difference_y, rtol=1e-8, atol=1e-8
+    )
+
+
+def test_multi_drive_filtered_gradient_matches_finite_difference():
+    pixels = np.array(
+        [[0.7 + 0.1j, -0.2 + 0.3j], [0.4 - 0.2j, 0.1 + 0.5j]]
+    )
+    pixel_dt = 0.02
+    solver = DysolvePropagator.from_drives(
+        0.31 * sigmaz(),
+        [(0.19 * sigmax(), 1.3), (0.13 * sigmay(), 1.9)],
+        options={"max_order": 3, "max_dt": pixel_dt / 2, "a_tol": 1e-12},
+    )
+
+    _, gradients_x, gradients_y = solver.filtered_envelope_propagator(
+        pixels,
+        pixel_dt,
+        subpixels_per_pixel=2,
+        bandwidth=80.0,
+        gradient="quadratures",
+    )
+    eps = 1e-6
+    drive_index = 1
+    pixel_index = 0
+    plus = pixels.copy(); plus[drive_index, pixel_index] += eps
+    minus = pixels.copy(); minus[drive_index, pixel_index] -= eps
+    finite_difference_x = (
+        _qobj_data(solver.filtered_envelope_propagator(plus, pixel_dt, 2, 80.0))
+        - _qobj_data(solver.filtered_envelope_propagator(minus, pixel_dt, 2, 80.0))
+    ) / (2 * eps)
+    np.testing.assert_allclose(
+        _qobj_data(gradients_x[drive_index][pixel_index]),
+        finite_difference_x,
+        rtol=1e-8,
+        atol=1e-8,
+    )
+
+    plus = pixels.copy(); plus[drive_index, pixel_index] += 1j * eps
+    minus = pixels.copy(); minus[drive_index, pixel_index] -= 1j * eps
+    finite_difference_y = (
+        _qobj_data(solver.filtered_envelope_propagator(plus, pixel_dt, 2, 80.0))
+        - _qobj_data(solver.filtered_envelope_propagator(minus, pixel_dt, 2, 80.0))
+    ) / (2 * eps)
+    np.testing.assert_allclose(
+        _qobj_data(gradients_y[drive_index][pixel_index]),
+        finite_difference_y,
+        rtol=1e-8,
+        atol=1e-8,
+    )
 
 
 @pytest.mark.parametrize("eff_omega", [-10.0, -1.0, -0.1, 0.1, 1.0, 10.0])
