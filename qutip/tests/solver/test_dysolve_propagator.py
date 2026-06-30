@@ -49,6 +49,27 @@ def test_envelope_propagator_matches_constant_amplitude_evolution():
     )
 
 
+def test_prepared_envelope_matches_direct_subpropagator_contraction():
+    dt = 0.02
+    amplitudes = np.array([0.7 + 0.1j, -0.2 + 0.3j, 0.4 - 0.2j])
+    solver = DysolvePropagator(
+        0.31 * sigmaz(),
+        0.19 * sigmax(),
+        1.3,
+        options={"max_order": 3, "max_dt": dt, "a_tol": 1e-12},
+    )
+    prepared = solver.prepare_envelope(amplitudes, dt)
+
+    for t0 in (0.0, 0.13, 1.7):
+        np.testing.assert_allclose(
+            prepared.subpropagators(t0),
+            solver._compute_envelope_subprops(amplitudes, dt, t0),
+            rtol=1e-12,
+            atol=1e-12,
+        )
+
+
+
 def test_envelope_propagator_real_gradient_matches_finite_difference():
     dt = 0.02
     amplitudes = np.array([0.7, -0.2, 0.4])

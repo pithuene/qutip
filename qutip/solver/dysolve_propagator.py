@@ -7,7 +7,7 @@ from numbers import Number
 import itertools
 
 
-__all__ = ['DysolvePropagator', 'dysolve_propagator', 'gaussian_filter_matrix']
+__all__ = ['DysolvePropagator', 'PreparedDysolveEnvelope', 'dysolve_propagator', 'gaussian_filter_matrix']
 
 
 def gaussian_filter_matrix(
@@ -51,6 +51,68 @@ def gaussian_filter_matrix(
             matrix, row_sums, out=np.zeros_like(matrix), where=row_sums != 0.0
         )
     return matrix
+
+
+class PreparedDysolveEnvelope:
+    """Prepared t0-independent Dysolve contraction for a fixed envelope.
+
+    The expensive envelope-amplitude contraction is prepared once for a fixed
+    subpixel amplitude vector and timestep.  Absolute pulse start time remains
+    a runtime input through carrier phase factors, so this object can be reused
+    by identical pulses placed at different times.
+    """
+
+    def __init__(self, solver, amplitudes: ArrayLike, dt: float):
+        self._solver = solver
+        self.dt = float(dt)
+        self._amplitudes = solver._as_drive_amplitudes(amplitudes)
+        self.n_subpixels = int(self._amplitudes.shape[1])
+        self._length = len(solver._eigenenergies)
+        self._S0 = solver._compute_Sns(self.dt)[0]
+        self._terms = self._prepare_terms()
+
+    def _prepare_terms(self):
+        solver = self._solver
+        local_times = np.arange(self.n_subpixels, dtype=float) * self.dt
+        Sns = solver._compute_Sns(self.dt)
+        terms = []
+        for n in range(1, solver.max_order + 1):
+            omega_sums = solver._get_omega_sums(n)
+            amp_factors = solver._envelope_branch_factors(self._amplitudes, n)
+            branch_weights = np.exp(1j * np.outer(local_times, omega_sums)) * amp_factors
+            unique_omega_sums, inverse = np.unique(omega_sums, return_inverse=True)
+            contractions = np.zeros(
+                (len(unique_omega_sums), self.n_subpixels, self._length, self._length),
+                dtype=np.complex128,
+            )
+            for group_index in range(len(unique_omega_sums)):
+                branch_indices = inverse == group_index
+                contractions[group_index] = np.tensordot(
+                    branch_weights[:, branch_indices],
+                    Sns[n][branch_indices],
+                    axes=(1, 0),
+                )
+            terms.append((unique_omega_sums, contractions))
+        return tuple(terms)
+
+    def subpropagators(self, t0: float = 0.0) -> ArrayLike:
+        """Return subpixel propagators for a pulse starting at ``t0``."""
+        subpropagators = np.broadcast_to(
+            self._S0, (self.n_subpixels, self._length, self._length)
+        ).astype(np.complex128, copy=True)
+        for omega_sums, contractions in self._terms:
+            phases = np.exp(1j * omega_sums * float(t0))
+            subpropagators += np.tensordot(phases, contractions, axes=(0, 0))
+        return subpropagators
+
+    def propagator(self, t0: float = 0.0) -> Qobj:
+        """Return the full envelope propagator for a pulse starting at ``t0``."""
+        total = np.eye(self._length, dtype=np.complex128)
+        for subpropagator in self.subpropagators(t0):
+            total = subpropagator @ total
+        return Qobj(total, self._solver._H_0._dims, copy=False).transform(
+            self._solver._basis, True
+        )
 
 
 class DysolvePropagator:
@@ -622,6 +684,10 @@ class DysolvePropagator:
             return subpropagators, dsubprops_dx, dsubprops_dy
         return subpropagators
 
+    def prepare_envelope(self, amplitudes: ArrayLike, dt: float) -> PreparedDysolveEnvelope:
+        """Prepare a reusable t0-independent envelope contraction."""
+        return PreparedDysolveEnvelope(self, amplitudes, dt)
+
     def envelope_propagator(
         self,
         amplitudes: ArrayLike,
@@ -649,13 +715,13 @@ class DysolvePropagator:
                 "gradient must be False, 'real', or 'quadratures'"
             )
         want_gradient = bool(gradient)
-        if want_gradient:
-            step_data = self._compute_envelope_subprops(
-                amplitudes, dt, t0, gradient=True
-            )
-            subprops, dsubprops_dx, dsubprops_dy = step_data
-        else:
-            subprops = self._compute_envelope_subprops(amplitudes, dt, t0)
+        if not want_gradient:
+            return self.prepare_envelope(amplitudes, dt).propagator(t0)
+
+        step_data = self._compute_envelope_subprops(
+            amplitudes, dt, t0, gradient=True
+        )
+        subprops, dsubprops_dx, dsubprops_dy = step_data
 
         length = len(self._eigenenergies)
         prefixes = [np.eye(length, dtype=np.complex128)]
@@ -665,9 +731,6 @@ class DysolvePropagator:
         U = Qobj(total, self._H_0._dims, copy=False).transform(
             self._basis, True
         )
-        if not want_gradient:
-            return U
-
         suffix = np.eye(length, dtype=np.complex128)
         n_subpixels = len(subprops)
         dU_dx = [[None] * n_subpixels for _ in range(self._n_drives)]
