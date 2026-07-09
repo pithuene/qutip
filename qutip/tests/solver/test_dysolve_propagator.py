@@ -139,6 +139,51 @@ def test_envelope_propagator_quadrature_gradients_match_finite_difference():
 
 
 
+def test_envelope_parameter_gradients_match_quadrature_contraction():
+    dt = 0.02
+    amplitudes = np.array([0.7 + 0.1j, -0.2 + 0.3j, 0.4 - 0.2j])
+    derivatives = np.array(
+        [
+            [1.0, 2.0, 0.0],
+            [0.0, 0.5j, -1.0j],
+        ],
+        dtype=complex,
+    )
+    solver = DysolvePropagator(
+        0.31 * sigmaz(),
+        0.19 * sigmax(),
+        1.3,
+        options={"max_order": 3, "max_dt": dt, "a_tol": 1e-12},
+    )
+
+    propagator, parameter_gradients = solver.envelope_parameter_gradients(
+        amplitudes,
+        derivatives,
+        dt,
+    )
+    reference_propagator, gradients_x, gradients_y = solver.envelope_propagator(
+        amplitudes,
+        dt,
+        gradient="quadratures",
+    )
+    expected = []
+    for derivative in derivatives:
+        gradient = 0 * reference_propagator
+        for sample_derivative, gradient_x, gradient_y in zip(
+            derivative,
+            gradients_x,
+            gradients_y,
+            strict=True,
+        ):
+            gradient += sample_derivative.real * gradient_x + sample_derivative.imag * gradient_y
+        expected.append(gradient)
+
+    np.testing.assert_allclose(_qobj_data(propagator), _qobj_data(reference_propagator), rtol=1e-12, atol=1e-12)
+    for actual, expected_gradient in zip(parameter_gradients, expected, strict=True):
+        np.testing.assert_allclose(_qobj_data(actual), _qobj_data(expected_gradient), rtol=1e-12, atol=1e-12)
+
+
+
 def test_multi_drive_propagator_matches_qutip_propagator():
     H_0 = 0.37 * sigmaz()
     X_0 = 0.11 * sigmax()

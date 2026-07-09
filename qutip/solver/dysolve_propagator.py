@@ -688,6 +688,76 @@ class DysolvePropagator:
         """Prepare a reusable t0-independent envelope contraction."""
         return PreparedDysolveEnvelope(self, amplitudes, dt)
 
+    def envelope_parameter_gradients(
+        self,
+        amplitudes: ArrayLike,
+        amplitude_derivatives: ArrayLike,
+        dt: float,
+        t0: float = 0.0,
+    ):
+        """Return an envelope propagator and gradients for arbitrary parameters.
+
+        ``amplitude_derivatives`` contains ``d amplitudes / d parameter``.  For
+        one drive it may have shape ``(n_parameters, n_subpixels)``.  For one or
+        more drives it may have shape ``(n_parameters, n_drives, n_subpixels)``.
+        Complex derivatives are interpreted in the same I/Q convention as
+        ``amplitudes``.
+        """
+        amplitudes = self._as_drive_amplitudes(amplitudes)
+        derivatives = np.asarray(amplitude_derivatives, dtype=np.complex128)
+        if derivatives.ndim == 2 and self._n_drives == 1:
+            derivatives = derivatives[:, None, :]
+        if derivatives.ndim != 3:
+            raise ValueError(
+                "amplitude_derivatives must have shape (n_parameters, n_subpixels) "
+                "for one drive or (n_parameters, n_drives, n_subpixels)"
+            )
+        n_parameters = int(derivatives.shape[0])
+        if derivatives.shape[1:] != amplitudes.shape:
+            raise ValueError(
+                "amplitude_derivatives trailing dimensions must match amplitudes"
+            )
+
+        subprops, dsubprops_dx, dsubprops_dy = self._compute_envelope_subprops(
+            amplitudes, dt, t0, gradient=True
+        )
+        length = len(self._eigenenergies)
+        prefixes = [np.eye(length, dtype=np.complex128)]
+        for subprop in subprops:
+            prefixes.append(subprop @ prefixes[-1])
+        total = prefixes[-1]
+        U = Qobj(total, self._H_0._dims, copy=False).transform(
+            self._basis, True
+        )
+
+        parameter_gradients = np.zeros(
+            (n_parameters, length, length), dtype=np.complex128
+        )
+        suffix = np.eye(length, dtype=np.complex128)
+        for index in range(len(subprops) - 1, -1, -1):
+            for drive_index in range(self._n_drives):
+                gradient_x = (
+                    suffix @ dsubprops_dx[drive_index, index] @ prefixes[index]
+                )
+                gradient_y = (
+                    suffix @ dsubprops_dy[drive_index, index] @ prefixes[index]
+                )
+                real_derivatives = derivatives[:, drive_index, index].real
+                imaginary_derivatives = derivatives[:, drive_index, index].imag
+                parameter_gradients += (
+                    real_derivatives[:, None, None] * gradient_x
+                    + imaginary_derivatives[:, None, None] * gradient_y
+                )
+            suffix = suffix @ subprops[index]
+
+        dU_dp = tuple(
+            Qobj(gradient, self._H_0._dims, copy=False).transform(
+                self._basis, True
+            )
+            for gradient in parameter_gradients
+        )
+        return U, dU_dp
+
     def envelope_propagator(
         self,
         amplitudes: ArrayLike,
