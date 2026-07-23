@@ -145,16 +145,17 @@ class DysolvePropagator:
             The absolute tolerance used when computing the propagators
             (default is 1e-10).
 
-        - "max_dt"
+        - "min_timestep"
 
-            The maximum time increment used when computing propagators
-            (default is 0.1).
+            Finest timing-grid increment for adaptive dyadic propagation.
+            Absolute start and final times are rounded to this grid. Must be
+            combined with ``error_tolerance_per_time``.
 
-        - "batch_size"
+        - "error_tolerance_per_time"
 
-            Number of same-dt substeps to contract at once when materializing
-            subpropagators (default is 10). Larger values reduce Python
-            overhead for small Hilbert spaces, but use more memory.
+            Maximum accepted full-step versus two-half-step error divided by
+            step duration. Enables adaptive dyadic propagation when combined
+            with ``min_timestep``.
 
     Notes
     -----
@@ -219,21 +220,31 @@ class DysolvePropagator:
         self._elems = self._elems_by_drive[0]
 
         # Options
-        if options is None:
-            self.max_order = 4
-            self.a_tol = 1e-10
-            self.max_dt = 0.1
-            self.batch_size = 10
-        else:
-            self.max_order = options.get('max_order', 4)
-            self.max_dt = options.get('max_dt', 0.1)
-            self.a_tol = options.get('a_tol', 1e-10)
-            self.batch_size = options.get('batch_size', 10)
+        options = {} if options is None else options
+        if 'max_dt' in options:
+            raise ValueError(
+                "max_dt is no longer supported; use min_timestep and "
+                "error_tolerance_per_time"
+            )
+
+        self.max_order = options.get('max_order', 4)
+        self.a_tol = options.get('a_tol', 1e-10)
+        self.min_timestep = options.get('min_timestep')
+        self.error_tolerance_per_time = options.get(
+            'error_tolerance_per_time'
+        )
+        if self.max_order > 0:
+            if self.min_timestep is None or self.error_tolerance_per_time is None:
+                raise ValueError(
+                    "min_timestep and error_tolerance_per_time are required"
+                )
+            if self.min_timestep <= 0:
+                raise ValueError("min_timestep must be positive")
+            if self.error_tolerance_per_time <= 0:
+                raise ValueError("error_tolerance_per_time must be positive")
 
         # Memoization
-        self._dt_key_decimals = (
-            options.get('dt_key_decimals', 15) if options is not None else 15
-        )
+        self._dt_key_decimals = options.get('dt_key_decimals', 15)
         self._dt_Sns = {}
         self._omega_vectors = {}
         self._omega_sums = {}
@@ -264,8 +275,8 @@ class DysolvePropagator:
 
         Notes
         -----
-        If t_f - t_i > max_dt, splits the evolution into smaller ones
-        to then reconstruct U(t_f, t_i).
+        Adaptive propagation selects a dyadic timestep and Dyson order from
+        ``min_timestep`` and ``error_tolerance_per_time``.
 
         Memoization is used. First call may be slow but the next calls
         should be faster.
@@ -291,36 +302,7 @@ class DysolvePropagator:
         t = np.asarray(t, dtype=float)
         if len(t) <= 1:
             return [qeye_like(self._H_0)]
-
-        intervals = np.diff(t)
-        direction = np.sign(intervals[0])
-        if (
-            direction == 0
-            or np.any(np.sign(intervals) != direction)
-            or np.any(np.abs(intervals) <= self.a_tol)
-        ):
-            return self._propagators_by_interval(t)
-
-        step_times = []
-        step_dts = []
-        output_after_step = []
-        for t_i, time_diff in zip(t[:-1], intervals):
-            dt = self.max_dt * np.sign(time_diff)
-            n_steps = abs(int(time_diff / self.max_dt))
-            for j in range(n_steps):
-                step_times.append(t_i + j*dt)
-                step_dts.append(dt)
-                output_after_step.append(False)
-            remaining = time_diff - n_steps*dt
-            if abs(remaining) > self.a_tol:
-                step_times.append(t_i + n_steps*dt)
-                step_dts.append(remaining)
-                output_after_step.append(False)
-            output_after_step[-1] = True
-
-        return self._propagators_from_steps(
-            np.asarray(step_times), np.asarray(step_dts), output_after_step
-        )
+        return self._propagators_by_interval(t)
 
     def _propagators_by_interval(self, t: ArrayLike) -> list[Qobj]:
         Us = [qeye_like(self._H_0).transform(self._basis, True)]
@@ -332,42 +314,6 @@ class DysolvePropagator:
                     self._basis, True
                 )
             )
-        return Us
-
-    def _propagators_from_steps(
-        self,
-        step_times: ArrayLike,
-        step_dts: ArrayLike,
-        output_after_step: list[bool],
-    ) -> list[Qobj]:
-        Us = [qeye_like(self._H_0).transform(self._basis, True)]
-        U = np.eye(len(self._eigenenergies), dtype=np.complex128)
-        batch_size = self.batch_size
-        step = 0
-
-        while step < len(step_times):
-            dt = step_dts[step]
-            run_stop = step + 1
-            while (
-                run_stop < len(step_times)
-                and abs(step_dts[run_stop] - dt) <= self.a_tol
-            ):
-                run_stop += 1
-
-            for start in range(step, run_stop, batch_size):
-                stop = min(start + batch_size, run_stop)
-                subprops = self._compute_subprops(step_times[start:stop], dt)
-                for offset, subpropagator in enumerate(subprops):
-                    current_step = start + offset
-                    U = subpropagator @ U
-                    if output_after_step[current_step]:
-                        Us.append(
-                            Qobj(
-                                U.copy(), self._H_0._dims, copy=False
-                            ).transform(self._basis, True)
-                        )
-            step = run_stop
-
         return Us
 
     def _get_branch_metadata(self, n: int) -> tuple[ArrayLike, ArrayLike, ArrayLike]:
@@ -918,6 +864,99 @@ class DysolvePropagator:
             self._format_drive_gradients(dU_dy_du),
         )
 
+    def _adaptive_split_error_rate(
+        self,
+        current_time: float,
+        dt: float,
+        order: int,
+    ) -> float:
+        """Estimate one adaptive step's error per unit evolution time."""
+        half_dt = dt / 2
+        full_step = self._compute_subprop(
+            current_time, dt, max_order=order
+        )
+        first_half = self._compute_subprop(
+            current_time, half_dt, max_order=order
+        )
+        second_half = self._compute_subprop(
+            current_time + half_dt, half_dt, max_order=order
+        )
+        split_step = second_half @ first_half
+        return float(
+            np.linalg.norm(full_step - split_step, ord='nuc') / abs(dt)
+        )
+
+    def _adaptive_plan_for_order(
+        self,
+        start_tick: int,
+        stop_tick: int,
+        order: int,
+        piece_limit: int = None,
+    ) -> tuple[int, ...] | None:
+        """Build actual-time-checked dyadic steps for one Dyson order."""
+        direction = 1 if stop_tick > start_tick else -1
+        current_tick = start_tick
+        step_ticks = []
+
+        while current_tick != stop_tick:
+            remaining_ticks = abs(stop_tick - current_tick)
+            candidate_tick = 1
+            accepted_tick = None
+            while candidate_tick <= remaining_ticks:
+                dt = direction * candidate_tick * self.min_timestep
+                current_time = current_tick * self.min_timestep
+                error_rate = self._adaptive_split_error_rate(
+                    current_time, dt, order
+                )
+                if not error_rate <= self.error_tolerance_per_time:
+                    break
+                accepted_tick = candidate_tick
+                candidate_tick *= 2
+
+            if accepted_tick is None:
+                return None
+            signed_tick = direction * accepted_tick
+            step_ticks.append(signed_tick)
+            current_tick += signed_tick
+            if piece_limit is not None and len(step_ticks) > piece_limit:
+                return tuple(step_ticks)
+
+        return tuple(step_ticks)
+
+    def _adaptive_interval_plan(
+        self,
+        t_i: float,
+        t_f: float,
+    ) -> tuple[int, tuple[int, ...]]:
+        """Select a Dyson order and dyadic step plan for one interval."""
+        start_tick = round(float(t_i) / self.min_timestep)
+        stop_tick = round(float(t_f) / self.min_timestep)
+        if start_tick == stop_tick:
+            return 1, ()
+
+        escalation_thresholds = {1: 1000, 2: 200, 3: 100}
+        for order in range(1, self.max_order + 1):
+            piece_limit = (
+                escalation_thresholds.get(order)
+                if order < self.max_order
+                else None
+            )
+            step_ticks = self._adaptive_plan_for_order(
+                start_tick,
+                stop_tick,
+                order,
+                piece_limit,
+            )
+            if step_ticks is None:
+                continue
+            if piece_limit is None or len(step_ticks) <= piece_limit:
+                return order, step_ticks
+
+        raise ValueError(
+            "Requested error_tolerance_per_time cannot be met with "
+            "max_order and min_timestep"
+        )
+
     def _compute_interval(
         self,
         t_i: float,
@@ -932,45 +971,54 @@ class DysolvePropagator:
             U = np.eye(len(self._eigenenergies), dtype=np.complex128)
         if abs(time_diff) <= self.a_tol:
             return U
+        if self.max_order == 0:
+            return self._compute_subprop(
+                t_i, time_diff, max_order=0
+            ) @ U
 
-        dt = self.max_dt * np.sign(time_diff)
-        n_steps = abs(int(time_diff / self.max_dt))
-        batch_size = self.batch_size
-
-        for start in range(0, n_steps, batch_size):
-            stop = min(start + batch_size, n_steps)
-            current_times = t_i + np.arange(start, stop) * dt
-            for subpropagator in self._compute_subprops(current_times, dt):
-                U = subpropagator @ U
-
-        remaining = time_diff - n_steps*dt
-        if abs(remaining) > self.a_tol:
-            U = self._compute_subprop(t_i + n_steps*dt, remaining) @ U
-
+        order, step_ticks = self._adaptive_interval_plan(t_i, t_f)
+        current_tick = round(float(t_i) / self.min_timestep)
+        for step_tick in step_ticks:
+            current_time = current_tick * self.min_timestep
+            dt = step_tick * self.min_timestep
+            U = self._compute_subprop(
+                current_time, dt, max_order=order
+            ) @ U
+            current_tick += step_tick
         return U
 
     def _compute_subprops(
-        self, current_times: ArrayLike, dt: float
+        self,
+        current_times: ArrayLike,
+        dt: float,
+        max_order: int = None,
     ) -> ArrayLike:
         """
         Computes a batch of subpropagators.
         """
         current_times = np.asarray(current_times, dtype=float)
-        Sns = self._compute_Sns(dt)
+        if max_order is None:
+            max_order = self.max_order
+        Sns = self._compute_Sns(dt, max_order=max_order)
         length = len(self._eigenenergies)
 
         subpropagators = np.broadcast_to(
             Sns[0], (len(current_times), length, length)
         ).astype(np.complex128, copy=True)
 
-        for n in range(1, self.max_order + 1):
+        for n in range(1, max_order + 1):
             omega_sums = self._get_omega_sums(n)
             phases = np.exp(1j * np.outer(current_times, omega_sums))
             subpropagators += np.tensordot(phases, Sns[n], axes=(1, 0))
 
         return subpropagators
 
-    def _compute_subprop(self, current_time: float, dt: float) -> ArrayLike:
+    def _compute_subprop(
+        self,
+        current_time: float,
+        dt: float,
+        max_order: int = None,
+    ) -> ArrayLike:
         """
         Computes a subpropagator U(current_time + dt, current_time).
 
@@ -988,7 +1036,9 @@ class DysolvePropagator:
             U(current_time + dt, current_time).
 
         """
-        return self._compute_subprops([current_time], dt)[0]
+        return self._compute_subprops(
+            [current_time], dt, max_order=max_order
+        )[0]
 
 
 def dysolve_propagator(
@@ -1035,10 +1085,9 @@ def dysolve_propagator(
             The absolute tolerance used when computing the propagators
             (default is 1e-10).
 
-        - "max_dt"
+        - "min_timestep", "error_tolerance_per_time"
 
-            The maximum time increment used when computing propagators
-            (default is 0.1).
+            Required adaptive timing-grid and error-rate settings.
 
     Returns
     -------

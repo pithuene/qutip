@@ -31,22 +31,19 @@ def _qobj_data(obj):
     return obj.full()
 
 
-def test_envelope_propagator_matches_constant_amplitude_evolution():
-    dt = 0.025
-    amplitudes = np.ones(5)
-    solver = DysolvePropagator(
-        0.37 * sigmaz(),
-        0.23 * sigmax(),
-        1.7,
-        options={"max_order": 3, "max_dt": dt, "a_tol": 1e-12},
-    )
-
-    shaped = solver.envelope_propagator(amplitudes, dt)
-    constant = solver(len(amplitudes) * dt)
-
-    np.testing.assert_allclose(
-        _qobj_data(shaped), _qobj_data(constant), rtol=1e-12, atol=1e-12
-    )
+def _adaptive_options(
+    min_timestep=0.001,
+    *,
+    max_order=3,
+    error_tolerance_per_time=1e-6,
+    a_tol=1e-12,
+):
+    return {
+        "max_order": max_order,
+        "min_timestep": min_timestep,
+        "error_tolerance_per_time": error_tolerance_per_time,
+        "a_tol": a_tol,
+    }
 
 
 def test_prepared_envelope_matches_direct_subpropagator_contraction():
@@ -56,7 +53,7 @@ def test_prepared_envelope_matches_direct_subpropagator_contraction():
         0.31 * sigmaz(),
         0.19 * sigmax(),
         1.3,
-        options={"max_order": 3, "max_dt": dt, "a_tol": 1e-12},
+        options=_adaptive_options(dt),
     )
     prepared = solver.prepare_envelope(amplitudes, dt)
 
@@ -77,7 +74,7 @@ def test_envelope_propagator_real_gradient_matches_finite_difference():
         0.31 * sigmaz(),
         0.19 * sigmax(),
         1.3,
-        options={"max_order": 3, "max_dt": dt, "a_tol": 1e-12},
+        options=_adaptive_options(dt),
     )
 
     _, gradients = solver.envelope_propagator(amplitudes, dt, gradient="real")
@@ -103,7 +100,7 @@ def test_envelope_propagator_quadrature_gradients_match_finite_difference():
         0.31 * sigmaz(),
         0.19 * sigmax(),
         1.3,
-        options={"max_order": 3, "max_dt": dt, "a_tol": 1e-12},
+        options=_adaptive_options(dt),
     )
 
     _, gradients_x, gradients_y = solver.envelope_propagator(
@@ -153,7 +150,7 @@ def test_envelope_parameter_gradients_match_quadrature_contraction():
         0.31 * sigmaz(),
         0.19 * sigmax(),
         1.3,
-        options={"max_order": 3, "max_dt": dt, "a_tol": 1e-12},
+        options=_adaptive_options(dt),
     )
 
     propagator, parameter_gradients = solver.envelope_parameter_gradients(
@@ -194,7 +191,7 @@ def test_multi_drive_propagator_matches_qutip_propagator():
     solver = DysolvePropagator.from_drives(
         H_0,
         [(X_0, omega_0), (X_1, omega_1)],
-        options={"max_order": 4, "max_dt": 0.02, "a_tol": 1e-12},
+        options=_adaptive_options(0.001, max_order=4),
     )
 
     dysolve_U = solver(t)
@@ -224,7 +221,7 @@ def test_multi_drive_envelope_gradients_match_finite_difference():
     solver = DysolvePropagator.from_drives(
         0.31 * sigmaz(),
         [(0.19 * sigmax(), 1.3), (0.13 * sigmay(), 1.9)],
-        options={"max_order": 3, "max_dt": dt, "a_tol": 1e-12},
+        options=_adaptive_options(dt),
     )
 
     _, gradients_x, gradients_y = solver.envelope_propagator(
@@ -282,7 +279,7 @@ def test_filtered_envelope_gradient_matches_finite_difference():
         0.31 * sigmaz(),
         0.19 * sigmax(),
         1.3,
-        options={"max_order": 3, "max_dt": pixel_dt / 2, "a_tol": 1e-12},
+        options=_adaptive_options(pixel_dt / 2),
     )
 
     _, gradients_x, gradients_y = solver.filtered_envelope_propagator(
@@ -339,7 +336,7 @@ def test_multi_drive_filtered_gradient_matches_finite_difference():
     solver = DysolvePropagator.from_drives(
         0.31 * sigmaz(),
         [(0.19 * sigmax(), 1.3), (0.13 * sigmay(), 1.9)],
-        options={"max_order": 3, "max_dt": pixel_dt / 2, "a_tol": 1e-12},
+        options=_adaptive_options(pixel_dt / 2),
     )
 
     _, gradients_x, gradients_y = solver.filtered_envelope_propagator(
@@ -470,11 +467,11 @@ def test_zeroth_order(H_0, t_i, t_f):
 @pytest.mark.parametrize("t_i, t_f", [
     (0, 0.001), (0.001, 0), (-0.001, 0.001)
 ])
-def test_zeroth_order_shorter_than_max_dt(t_i, t_f):
+def test_short_zeroth_order_interval(t_i, t_f):
     H_0 = tensor(sigmax(), sigmaz())
     dysolve = DysolvePropagator(
         H_0, qeye_like(H_0), 0,
-        options={'max_order': 0, 'max_dt': 0.1}
+        options={'max_order': 0}
     )
     U = dysolve(t_f, t_i)
 
@@ -482,6 +479,177 @@ def test_zeroth_order_shorter_than_max_dt(t_i, t_f):
 
     with CoreOptions(atol=1e-10, rtol=1e-10):
         assert U == exp
+
+
+@pytest.mark.parametrize("options, message", [
+    ({}, "min_timestep and error_tolerance_per_time are required"),
+    ({'min_timestep': 0.01}, "min_timestep and error_tolerance_per_time are required"),
+    ({'error_tolerance_per_time': 1e-5}, "min_timestep and error_tolerance_per_time are required"),
+    ({'max_dt': 0.1}, "max_dt is no longer supported"),
+    (
+        {
+            'min_timestep': 0.0,
+            'error_tolerance_per_time': 1e-5,
+        },
+        "min_timestep must be positive",
+    ),
+    (
+        {
+            'min_timestep': 0.01,
+            'error_tolerance_per_time': 0.0,
+        },
+        "error_tolerance_per_time must be positive",
+    ),
+])
+def test_adaptive_options_are_validated(options, message):
+    with pytest.raises(ValueError, match=message):
+        DysolvePropagator(sigmaz(), sigmax(), 1, options=options)
+
+
+def test_adaptive_order_escalates_by_piece_count(monkeypatch):
+    dysolve = DysolvePropagator(
+        sigmaz(), sigmax(), 1,
+        options={
+            'min_timestep': 1.0,
+            'error_tolerance_per_time': 1.0,
+            'max_order': 4,
+        },
+    )
+    largest_ticks_by_order = {1: 1, 2: 4, 3: 16, 4: 64}
+
+    def controlled_error_rate(self, current_time, dt, order):
+        del current_time
+        tick = round(abs(dt) / self.min_timestep)
+        return 0.0 if tick <= largest_ticks_by_order[order] else 2.0
+
+    monkeypatch.setattr(
+        DysolvePropagator,
+        "_adaptive_split_error_rate",
+        controlled_error_rate,
+    )
+
+    order, step_ticks = dysolve._adaptive_interval_plan(0.0, 1200.0)
+
+    assert order == 3
+    assert len(step_ticks) == 75
+    assert set(step_ticks) == {16}
+
+
+def test_adaptive_rejects_one_tick_when_split_check_fails(monkeypatch):
+    dysolve = DysolvePropagator(
+        sigmaz(), sigmax(), 1,
+        options={
+            'min_timestep': 1.0,
+            'error_tolerance_per_time': 1.0,
+            'max_order': 2,
+        },
+    )
+    def rejected_error_rate(self, current_time, dt, order):
+        del self, current_time, dt, order
+        return 2.0
+
+    monkeypatch.setattr(
+        DysolvePropagator,
+        "_adaptive_split_error_rate",
+        rejected_error_rate,
+    )
+
+    with pytest.raises(ValueError, match="cannot be met"):
+        dysolve._adaptive_interval_plan(0.0, 1.0)
+
+
+def test_adaptive_one_tick_still_checks_two_half_steps(monkeypatch):
+    dysolve = DysolvePropagator(
+        sigmaz(), sigmax(), 1,
+        options={
+            'min_timestep': 1.0,
+            'error_tolerance_per_time': 1.0,
+            'max_order': 1,
+        },
+    )
+    evaluated_steps = []
+
+    def record_subprop(current_time, dt, max_order=None):
+        del current_time, max_order
+        evaluated_steps.append(dt)
+        return np.eye(2, dtype=complex)
+
+    monkeypatch.setattr(dysolve, "_compute_subprop", record_subprop)
+
+    assert dysolve._adaptive_split_error_rate(0.0, 1.0, 1) == 0.0
+    assert evaluated_steps == [1.0, 0.5, 0.5]
+
+
+@pytest.mark.parametrize("t_i, t_f", [
+    (0.037, 0.237),
+    (0.237, 0.037),
+])
+def test_adaptive_propagator_matches_fine_reference_lazily(t_i, t_f):
+    H_0 = 0.7 * sigmaz()
+    X = 0.35 * sigmax()
+    omega = 5.0
+    tolerance_per_time = 1e-5
+    adaptive = DysolvePropagator(
+        H_0, X, omega,
+        options={
+            'min_timestep': 0.001,
+            'error_tolerance_per_time': tolerance_per_time,
+            'max_order': 4,
+            'a_tol': 1e-12,
+        },
+    )
+    reference = DysolvePropagator(
+        H_0, X, omega,
+        options=_adaptive_options(
+            0.00025,
+            max_order=4,
+            error_tolerance_per_time=1e-9,
+        ),
+    )
+
+    order, step_ticks = adaptive._adaptive_interval_plan(t_i, t_f)
+    actual = adaptive(t_f, t_i)
+    expected = reference(t_f, t_i)
+
+    assert order == 2
+    assert step_ticks
+    assert all(abs(tick) & (abs(tick) - 1) == 0 for tick in step_ticks)
+    assert (actual - expected).norm() < 3e-6
+    assert max(max(cached_orders) for cached_orders in adaptive._dt_Sns.values()) == order
+
+
+def test_adaptive_propagator_supports_time_lists():
+    H_0 = 0.7 * sigmaz()
+    X = 0.35 * sigmax()
+    times = [0.037, 0.137, 0.237]
+    adaptive = DysolvePropagator(
+        H_0, X, 5.0,
+        options={
+            'min_timestep': 0.001,
+            'error_tolerance_per_time': 1e-5,
+            'max_order': 4,
+            'a_tol': 1e-12,
+        },
+    )
+    reference = DysolvePropagator(
+        H_0, X, 5.0,
+        options=_adaptive_options(
+            0.00025,
+            max_order=4,
+            error_tolerance_per_time=1e-9,
+        ),
+    )
+
+    actual = adaptive.propagators(times)
+    expected = reference.propagators(times)
+
+    assert len(actual) == len(times)
+    assert all(
+        (actual_propagator - expected_propagator).norm() < 3e-6
+        for actual_propagator, expected_propagator in zip(
+            actual, expected, strict=True
+        )
+    )
 
 
 def test_dyson_orders_are_prepared_lazily(monkeypatch):
@@ -499,7 +667,7 @@ def test_dyson_orders_are_prepared_lazily(monkeypatch):
     )
     dysolve = DysolvePropagator(
         sigmaz(), sigmax(), 1,
-        options={'max_order': 3, 'a_tol': 1e-10}
+        options=_adaptive_options(0.01, a_tol=1e-10),
     )
 
     assert set(dysolve._compute_Sns(0.1, max_order=1)) == {0, 1}
@@ -529,7 +697,7 @@ def test_integral_a_tol_option_is_used(monkeypatch):
     )
     dysolve = DysolvePropagator(
         sigmaz(), sigmax(), 1,
-        options={'max_order': 1, 'a_tol': 1e-4}
+        options=_adaptive_options(0.01, max_order=1, a_tol=1e-4),
     )
     dysolve._compute_Sns(0.1)
 
@@ -543,7 +711,7 @@ def test_integral_a_tol_option_is_used(monkeypatch):
 @pytest.mark.parametrize("omega", [0, 1, 10])
 def test_2x2_propagators_single_time(H_0, X, t, omega):
     # Dysolve
-    options = {'max_order': 3, 'max_dt': 0.05}
+    options = _adaptive_options(0.001)
     U = dysolve_propagator(H_0, X, omega, t, options=options)
 
     # Qutip.solver.propagator
@@ -569,7 +737,7 @@ def test_2x2_propagators_single_time(H_0, X, t, omega):
 ])
 @pytest.mark.parametrize("omega", [0, 10])
 def test_2x2_propagators_list_times(H_0, X, ts, omega):
-    options = {'max_order': 3, 'max_dt': 0.01}
+    options = _adaptive_options(0.001)
     Us = dysolve_propagator(H_0, X, omega, ts, options=options)
 
     # Qutip.solver.propagator
@@ -601,7 +769,7 @@ def test_2x2_propagators_list_times(H_0, X, ts, omega):
     1, -1
 ])
 def test_4x4_propagators_single_time(H_0, X, omega, t_f):
-    options = {'max_order': 3, 'max_dt': 0.01}
+    options = _adaptive_options(0.001)
     U = dysolve_propagator(H_0, X, omega, t_f, options=options)
 
     # Qutip.solver.propagator
@@ -635,7 +803,7 @@ def test_4x4_propagators_single_time(H_0, X, omega, t_f):
     [-0.1, 0, 0.1]
 ])
 def test_4x4_propagators_list_times(H_0, X, omega, ts):
-    options = {'max_order': 3, 'max_dt': 0.01}
+    options = _adaptive_options(0.001)
     Us = dysolve_propagator(H_0, X, omega, ts, options=options)
 
     # Qutip.solver.propagator
