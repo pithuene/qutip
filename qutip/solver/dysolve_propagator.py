@@ -480,67 +480,70 @@ class DysolvePropagator:
         """
         return round(float(dt), self._dt_key_decimals)
 
-    def _compute_Sns(self, dt: float) -> dict:
-        """
-        Computes Sns for each branch vector. This implements a similar equation
-        to eq. (14) in Ref, but the function "f" is not used to avoid dealing
-        explicitly with limits.
-
-        Parameters
-        ----------
-        dt : float
-            The time increment.
-
-        Returns
-        -------
-        Sns : dict
-            Sns for each branch vector, keyed by Dyson order.
-        """
-        dt_key = self._dt_cache_key(dt)
-        if dt_key in self._dt_Sns:
-            return self._dt_Sns[dt_key]
-
-        dt = dt_key
-        Sns = {}
-        length = len(self._eigenenergies)
-        exp_H_0 = (-1j*dt*self._H_0).expm().full()
-        eigenenergies = np.asarray(self._eigenenergies)
-
-        Sns[0] = exp_H_0
-
-        for n in range(1, self.max_order + 1):
-            drive_indices, _, omega_vectors = self._get_branch_metadata(n)
-            Sn = np.zeros(
-                (len(omega_vectors), length, length), dtype=np.complex128
+    def _compute_Sn(self, dt: float, order: int) -> ArrayLike:
+        """Return one cached Dyson-order tensor for a time increment."""
+        if order < 0 or order > self.max_order:
+            raise ValueError(
+                f"order must be between 0 and max_order={self.max_order}"
             )
-            unique_drive_indices = np.unique(drive_indices, axis=0)
-            for drive_sequence in unique_drive_indices:
-                mask = np.all(drive_indices == drive_sequence[None, :], axis=1)
-                paths, matrix_elements = self._get_matrix_element_paths(
-                    tuple(drive_sequence)
-                )
-                if len(paths) == 0:
-                    continue
-                path_energies = eigenenergies[paths]
-                diff_lambdas = -np.diff(path_energies)[:, ::-1]
-                ket_bra_idx = paths[:, [0, -1]]
 
-                Sn_group = cy_compute_Sn(
-                    np.ascontiguousarray(omega_vectors[mask], dtype=float),
-                    np.ascontiguousarray(ket_bra_idx, dtype=np.int_),
-                    np.ascontiguousarray(diff_lambdas, dtype=float),
-                    np.ascontiguousarray(matrix_elements, dtype=np.complex128),
-                    dt,
-                    length,
-                    self.a_tol,
-                )
-                Sn_group *= (-1j / 2) ** n
-                Sn[mask] = exp_H_0 @ Sn_group
+        dt_key = self._dt_cache_key(dt)
+        cached_orders = self._dt_Sns.setdefault(dt_key, {})
+        if order in cached_orders:
+            return cached_orders[order]
 
-            Sns[n] = Sn
+        exp_H_0 = cached_orders.get(0)
+        if exp_H_0 is None:
+            exp_H_0 = (-1j * dt_key * self._H_0).expm().full()
+            cached_orders[0] = exp_H_0
+        if order == 0:
+            return exp_H_0
 
-        self._dt_Sns[dt_key] = Sns
-        return Sns
+        length = len(self._eigenenergies)
+        eigenenergies = np.asarray(self._eigenenergies)
+        drive_indices, _, omega_vectors = self._get_branch_metadata(order)
+        Sn = np.zeros(
+            (len(omega_vectors), length, length), dtype=np.complex128
+        )
+        unique_drive_indices = np.unique(drive_indices, axis=0)
+        for drive_sequence in unique_drive_indices:
+            mask = np.all(drive_indices == drive_sequence[None, :], axis=1)
+            paths, matrix_elements = self._get_matrix_element_paths(
+                tuple(drive_sequence)
+            )
+            if len(paths) == 0:
+                continue
+            path_energies = eigenenergies[paths]
+            diff_lambdas = -np.diff(path_energies)[:, ::-1]
+            ket_bra_idx = paths[:, [0, -1]]
+
+            Sn_group = cy_compute_Sn(
+                np.ascontiguousarray(omega_vectors[mask], dtype=float),
+                np.ascontiguousarray(ket_bra_idx, dtype=np.int_),
+                np.ascontiguousarray(diff_lambdas, dtype=float),
+                np.ascontiguousarray(matrix_elements, dtype=np.complex128),
+                dt_key,
+                length,
+                self.a_tol,
+            )
+            Sn_group *= (-1j / 2) ** order
+            Sn[mask] = exp_H_0 @ Sn_group
+
+        cached_orders[order] = Sn
+        return Sn
+
+    def _compute_Sns(self, dt: float, max_order: int = None) -> dict:
+        """Return cached Dyson tensors through ``max_order``."""
+        if max_order is None:
+            max_order = self.max_order
+        if max_order < 0 or max_order > self.max_order:
+            raise ValueError(
+                f"max_order must be between 0 and {self.max_order}"
+            )
+        return {
+            order: self._compute_Sn(dt, order)
+            for order in range(max_order + 1)
+        }
 
     def _as_drive_amplitudes(self, amplitudes: ArrayLike) -> ArrayLike:
         """Return amplitudes as an ``(n_drives, n_subpixels)`` array."""

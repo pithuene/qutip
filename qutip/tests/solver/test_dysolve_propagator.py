@@ -484,6 +484,34 @@ def test_zeroth_order_shorter_than_max_dt(t_i, t_f):
         assert U == exp
 
 
+def test_dyson_orders_are_prepared_lazily(monkeypatch):
+    computed_orders = []
+    compute_Sn = DysolvePropagator._compute_Sn.__globals__["cy_compute_Sn"]
+
+    def record_order(omega_vectors, *args, **kwargs):
+        computed_orders.append(omega_vectors.shape[1])
+        return compute_Sn(omega_vectors, *args, **kwargs)
+
+    monkeypatch.setitem(
+        DysolvePropagator._compute_Sn.__globals__,
+        "cy_compute_Sn",
+        record_order,
+    )
+    dysolve = DysolvePropagator(
+        sigmaz(), sigmax(), 1,
+        options={'max_order': 3, 'a_tol': 1e-10}
+    )
+
+    assert set(dysolve._compute_Sns(0.1, max_order=1)) == {0, 1}
+    assert computed_orders == [1]
+
+    dysolve._compute_Sns(0.1, max_order=1)
+    assert computed_orders == [1]
+
+    assert set(dysolve._compute_Sns(0.1)) == {0, 1, 2, 3}
+    assert computed_orders == [1, 2, 3]
+
+
 def test_integral_a_tol_option_is_used(monkeypatch):
     seen_a_tols = []
 
