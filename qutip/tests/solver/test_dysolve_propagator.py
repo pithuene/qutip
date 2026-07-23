@@ -517,8 +517,10 @@ def test_adaptive_order_escalates_by_piece_count(monkeypatch):
     )
     largest_ticks_by_order = {1: 1, 2: 4, 3: 16, 4: 64}
 
-    def controlled_error_rate(self, current_time, dt, order):
-        del current_time
+    def controlled_error_rate(
+        self, current_time, dt, order, step_propagator=None
+    ):
+        del current_time, step_propagator
         tick = round(abs(dt) / self.min_timestep)
         return 0.0 if tick <= largest_ticks_by_order[order] else 2.0
 
@@ -544,8 +546,10 @@ def test_adaptive_rejects_one_tick_when_split_check_fails(monkeypatch):
             'max_order': 2,
         },
     )
-    def rejected_error_rate(self, current_time, dt, order):
-        del self, current_time, dt, order
+    def rejected_error_rate(
+        self, current_time, dt, order, step_propagator=None
+    ):
+        del self, current_time, dt, order, step_propagator
         return 2.0
 
     monkeypatch.setattr(
@@ -650,6 +654,110 @@ def test_adaptive_propagator_supports_time_lists():
             actual, expected, strict=True
         )
     )
+
+
+def test_adaptive_constant_envelope_matches_constant_drive():
+    options = _adaptive_options(
+        0.001,
+        max_order=4,
+        error_tolerance_per_time=1e-5,
+    )
+    dysolve = DysolvePropagator(
+        0.7 * sigmaz(), 0.35 * sigmax(), 5.0, options=options
+    )
+
+    shaped = dysolve.adaptive_envelope_propagator(
+        lambda times: np.ones_like(times), 0.237, 0.037
+    )
+    constant = dysolve(0.237, 0.037)
+
+    np.testing.assert_allclose(
+        _qobj_data(shaped), _qobj_data(constant), rtol=1e-12, atol=1e-12
+    )
+
+
+def test_adaptive_shaped_envelope_matches_fine_reference():
+    start = 0.037
+    duration = 0.2
+    dysolve = DysolvePropagator(
+        0.7 * sigmaz(),
+        0.35 * sigmax(),
+        5.0,
+        options=_adaptive_options(
+            0.001,
+            max_order=4,
+            error_tolerance_per_time=1e-5,
+        ),
+    )
+
+    def amplitude(times):
+        return 0.7 + 0.15j * np.sin(2 * np.pi * (times - start) / duration)
+
+    actual = dysolve.adaptive_envelope_propagator(
+        amplitude, start + duration, start
+    )
+    reference_step_count = 1600
+    reference_dt = duration / reference_step_count
+    reference_times = start + (
+        np.arange(reference_step_count) + 0.5
+    ) * reference_dt
+    expected = dysolve.envelope_propagator(
+        amplitude(reference_times), reference_dt, t0=start
+    )
+
+    assert (actual - expected).norm() < 2e-7
+
+
+def test_adaptive_envelope_parameter_gradients_match_finite_difference():
+    start = 0.037
+    duration = 0.2
+    parameters = np.array([0.5, 0.2])
+    dysolve = DysolvePropagator(
+        0.7 * sigmaz(),
+        0.35 * sigmax(),
+        5.0,
+        options=_adaptive_options(
+            0.001,
+            max_order=4,
+            error_tolerance_per_time=1e-5,
+        ),
+    )
+
+    def amplitude(times, values=parameters):
+        tau = (times - start) / duration
+        return values[0] + values[1] * tau
+
+    def amplitude_derivatives(times):
+        tau = (times - start) / duration
+        return np.stack([np.ones_like(tau), tau])
+
+    _, gradients = dysolve.adaptive_envelope_parameter_gradients(
+        amplitude,
+        amplitude_derivatives,
+        start + duration,
+        start,
+    )
+
+    epsilon = 1e-6
+    for parameter_index, gradient in enumerate(gradients):
+        plus = parameters.copy()
+        minus = parameters.copy()
+        plus[parameter_index] += epsilon
+        minus[parameter_index] -= epsilon
+        plus_propagator = dysolve.adaptive_envelope_propagator(
+            lambda times, values=plus: amplitude(times, values),
+            start + duration,
+            start,
+        )
+        minus_propagator = dysolve.adaptive_envelope_propagator(
+            lambda times, values=minus: amplitude(times, values),
+            start + duration,
+            start,
+        )
+        finite_difference = (
+            plus_propagator - minus_propagator
+        ) / (2 * epsilon)
+        assert (gradient - finite_difference).norm() < 1e-8
 
 
 def test_dyson_orders_are_prepared_lazily(monkeypatch):

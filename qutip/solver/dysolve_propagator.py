@@ -1,3 +1,5 @@
+from collections.abc import Callable
+
 from qutip import Qobj, qeye_like
 from .cy.dysolve import cy_compute_Sn
 from numpy.typing import ArrayLike
@@ -590,6 +592,7 @@ class DysolvePropagator:
         t0: float = 0.0,
         *,
         gradient: bool | str = False,
+        max_order: int = None,
     ) -> ArrayLike | tuple[ArrayLike, ArrayLike, ArrayLike]:
         """
         Compute all subpixel propagators for a shaped envelope.
@@ -598,7 +601,9 @@ class DysolvePropagator:
         n_subpixels = amplitudes.shape[1]
 
         current_times = t0 + np.arange(n_subpixels, dtype=float) * dt
-        Sns = self._compute_Sns(dt)
+        if max_order is None:
+            max_order = self.max_order
+        Sns = self._compute_Sns(dt, max_order=max_order)
         length = len(self._eigenenergies)
         subpropagators = np.broadcast_to(
             Sns[0], (n_subpixels, length, length)
@@ -609,7 +614,7 @@ class DysolvePropagator:
             )
             dsubprops_dy = np.zeros_like(dsubprops_dx)
 
-        for n in range(1, self.max_order + 1):
+        for n in range(1, max_order + 1):
             omega_sums = self._get_omega_sums(n)
             phases = np.exp(1j * np.outer(current_times, omega_sums))
             if gradient:
@@ -864,22 +869,178 @@ class DysolvePropagator:
             self._format_drive_gradients(dU_dy_du),
         )
 
+    @staticmethod
+    def _adaptive_boundaries(
+        t_i: float,
+        t_f: float,
+        breakpoints: ArrayLike,
+    ) -> tuple[float, ...]:
+        """Return ordered interval boundaries inside the evolution span."""
+        lower, upper = sorted((float(t_i), float(t_f)))
+        interior = sorted(
+            float(point)
+            for point in np.asarray(breakpoints, dtype=float)
+            if lower < point < upper
+        )
+        if t_f < t_i:
+            interior.reverse()
+        return (float(t_i), *interior, float(t_f))
+
+    def adaptive_envelope_propagator(
+        self,
+        amplitude: Callable[[ArrayLike], ArrayLike],
+        t_f: float,
+        t_i: float = 0.0,
+        *,
+        breakpoints: ArrayLike = (),
+    ) -> Qobj:
+        """Propagate an absolute-time amplitude envelope adaptively."""
+        def step_propagator(current_time, dt, order):
+            sample_times = np.asarray([current_time + dt / 2])
+            amplitudes = amplitude(sample_times)
+            return self._compute_envelope_subprops(
+                amplitudes,
+                dt,
+                current_time,
+                max_order=order,
+            )[0]
+
+        propagator = np.eye(len(self._eigenenergies), dtype=np.complex128)
+        boundaries = self._adaptive_boundaries(t_i, t_f, breakpoints)
+        for interval_start, interval_end in zip(
+            boundaries[:-1], boundaries[1:], strict=True
+        ):
+            order, step_ticks = self._adaptive_interval_plan(
+                interval_start, interval_end, step_propagator
+            )
+            current_tick = round(interval_start / self.min_timestep)
+            for step_tick in step_ticks:
+                current_time = current_tick * self.min_timestep
+                dt = step_tick * self.min_timestep
+                propagator = step_propagator(
+                    current_time, dt, order
+                ) @ propagator
+                current_tick += step_tick
+        return Qobj(
+            propagator, self._H_0._dims, copy=False
+        ).transform(self._basis, True)
+
+    def adaptive_envelope_parameter_gradients(
+        self,
+        amplitude: Callable[[ArrayLike], ArrayLike],
+        amplitude_derivatives: Callable[[ArrayLike], ArrayLike],
+        t_f: float,
+        t_i: float = 0.0,
+        *,
+        breakpoints: ArrayLike = (),
+    ) -> tuple[Qobj, tuple[Qobj, ...]]:
+        """Propagate an envelope and its parameter derivatives adaptively."""
+        def step_propagator(current_time, dt, order):
+            sample_times = np.asarray([current_time + dt / 2])
+            amplitudes = amplitude(sample_times)
+            return self._compute_envelope_subprops(
+                amplitudes,
+                dt,
+                current_time,
+                max_order=order,
+            )[0]
+
+        propagator = np.eye(len(self._eigenenergies), dtype=np.complex128)
+        propagator_gradients = None
+        boundaries = self._adaptive_boundaries(t_i, t_f, breakpoints)
+        for interval_start, interval_end in zip(
+            boundaries[:-1], boundaries[1:], strict=True
+        ):
+            order, step_ticks = self._adaptive_interval_plan(
+                interval_start, interval_end, step_propagator
+            )
+            if not step_ticks:
+                continue
+            current_tick = round(interval_start / self.min_timestep)
+            for step_tick in step_ticks:
+                current_time = current_tick * self.min_timestep
+                dt = step_tick * self.min_timestep
+                sample_times = np.asarray([current_time + dt / 2])
+                amplitudes = amplitude(sample_times)
+                step_data = self._compute_envelope_subprops(
+                    amplitudes,
+                    dt,
+                    current_time,
+                    gradient=True,
+                    max_order=order,
+                )
+                step_propagator_matrix, step_gradients_x, step_gradients_y = (
+                    step_data
+                )
+                step_propagator_matrix = step_propagator_matrix[0]
+
+                derivatives = np.asarray(
+                    amplitude_derivatives(sample_times), dtype=np.complex128
+                )
+                if self._n_drives == 1 and derivatives.ndim == 2:
+                    derivatives = derivatives[:, None, :]
+                expected_shape = (self._n_drives, 1)
+                if derivatives.ndim != 3 or derivatives.shape[1:] != expected_shape:
+                    raise ValueError(
+                        "amplitude_derivatives must have shape "
+                        "(n_parameters, n_drives, n_times)"
+                    )
+                if propagator_gradients is None:
+                    propagator_gradients = np.zeros(
+                        (derivatives.shape[0], *propagator.shape),
+                        dtype=np.complex128,
+                    )
+
+                step_parameter_gradients = np.zeros_like(propagator_gradients)
+                for parameter_index, parameter_derivatives in enumerate(derivatives):
+                    for drive_index, derivative in enumerate(parameter_derivatives[:, 0]):
+                        step_parameter_gradients[parameter_index] += (
+                            derivative.real * step_gradients_x[drive_index, 0]
+                            + derivative.imag * step_gradients_y[drive_index, 0]
+                        )
+
+                previous_propagator = propagator
+                propagator = step_propagator_matrix @ previous_propagator
+                propagator_gradients = np.asarray([
+                    step_gradient @ previous_propagator
+                    + step_propagator_matrix @ propagator_gradient
+                    for step_gradient, propagator_gradient in zip(
+                        step_parameter_gradients,
+                        propagator_gradients,
+                        strict=True,
+                    )
+                ])
+                current_tick += step_tick
+
+        if propagator_gradients is None:
+            raise ValueError("adaptive envelope interval must span at least one timestep")
+
+        transformed_propagator = Qobj(
+            propagator, self._H_0._dims, copy=False
+        ).transform(self._basis, True)
+        transformed_gradients = tuple(
+            Qobj(gradient, self._H_0._dims, copy=False).transform(
+                self._basis, True
+            )
+            for gradient in propagator_gradients
+        )
+        return transformed_propagator, transformed_gradients
+
     def _adaptive_split_error_rate(
         self,
         current_time: float,
         dt: float,
         order: int,
+        step_propagator: Callable[[float, float, int], ArrayLike] = None,
     ) -> float:
         """Estimate one adaptive step's error per unit evolution time."""
+        if step_propagator is None:
+            step_propagator = self._compute_subprop
         half_dt = dt / 2
-        full_step = self._compute_subprop(
-            current_time, dt, max_order=order
-        )
-        first_half = self._compute_subprop(
-            current_time, half_dt, max_order=order
-        )
-        second_half = self._compute_subprop(
-            current_time + half_dt, half_dt, max_order=order
+        full_step = step_propagator(current_time, dt, order)
+        first_half = step_propagator(current_time, half_dt, order)
+        second_half = step_propagator(
+            current_time + half_dt, half_dt, order
         )
         split_step = second_half @ first_half
         return float(
@@ -892,29 +1053,48 @@ class DysolvePropagator:
         stop_tick: int,
         order: int,
         piece_limit: int = None,
+        step_propagator: Callable[[float, float, int], ArrayLike] = None,
     ) -> tuple[int, ...] | None:
         """Build actual-time-checked dyadic steps for one Dyson order."""
         direction = 1 if stop_tick > start_tick else -1
         current_tick = start_tick
         step_ticks = []
+        accepted_tick_hint = None
 
         while current_tick != stop_tick:
             remaining_ticks = abs(stop_tick - current_tick)
-            candidate_tick = 1
+            largest_remaining_tick = 1 << (remaining_ticks.bit_length() - 1)
+            candidate_tick = min(
+                accepted_tick_hint or largest_remaining_tick,
+                largest_remaining_tick,
+            )
             accepted_tick = None
-            while candidate_tick <= remaining_ticks:
+            while candidate_tick >= 1:
                 dt = direction * candidate_tick * self.min_timestep
                 current_time = current_tick * self.min_timestep
                 error_rate = self._adaptive_split_error_rate(
-                    current_time, dt, order
+                    current_time, dt, order, step_propagator
                 )
-                if not error_rate <= self.error_tolerance_per_time:
+                if error_rate <= self.error_tolerance_per_time:
+                    accepted_tick = candidate_tick
                     break
-                accepted_tick = candidate_tick
-                candidate_tick *= 2
+                candidate_tick //= 2
 
             if accepted_tick is None:
                 return None
+
+            larger_tick = accepted_tick * 2
+            while accepted_tick_hint is not None and larger_tick <= remaining_ticks:
+                dt = direction * larger_tick * self.min_timestep
+                current_time = current_tick * self.min_timestep
+                error_rate = self._adaptive_split_error_rate(
+                    current_time, dt, order, step_propagator
+                )
+                if not error_rate <= self.error_tolerance_per_time:
+                    break
+                accepted_tick = larger_tick
+                larger_tick *= 2
+            accepted_tick_hint = accepted_tick
             signed_tick = direction * accepted_tick
             step_ticks.append(signed_tick)
             current_tick += signed_tick
@@ -927,6 +1107,7 @@ class DysolvePropagator:
         self,
         t_i: float,
         t_f: float,
+        step_propagator: Callable[[float, float, int], ArrayLike] = None,
     ) -> tuple[int, tuple[int, ...]]:
         """Select a Dyson order and dyadic step plan for one interval."""
         start_tick = round(float(t_i) / self.min_timestep)
@@ -935,6 +1116,7 @@ class DysolvePropagator:
             return 1, ()
 
         escalation_thresholds = {1: 1000, 2: 200, 3: 100}
+        fallback_orders = []
         for order in range(1, self.max_order + 1):
             piece_limit = (
                 escalation_thresholds.get(order)
@@ -946,11 +1128,23 @@ class DysolvePropagator:
                 stop_tick,
                 order,
                 piece_limit,
+                step_propagator,
             )
             if step_ticks is None:
                 continue
+            fallback_orders.append(order)
             if piece_limit is None or len(step_ticks) <= piece_limit:
                 return order, step_ticks
+
+        for fallback_order in reversed(fallback_orders):
+            step_ticks = self._adaptive_plan_for_order(
+                start_tick,
+                stop_tick,
+                fallback_order,
+                step_propagator=step_propagator,
+            )
+            if step_ticks is not None:
+                return fallback_order, step_ticks
 
         raise ValueError(
             "Requested error_tolerance_per_time cannot be met with "
