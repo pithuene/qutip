@@ -1301,8 +1301,16 @@ class DysolvePropagator:
         order: int,
         piece_limit: int = None,
         step_propagator: Callable[[float, float, int], ArrayLike] = None,
+        step_error_rate: Callable[[float, float, int], float] = None,
     ) -> tuple[int, ...] | None:
         """Build actual-time-checked dyadic steps for one Dyson order."""
+        def evaluate_step_error(current_time, dt):
+            if step_error_rate is not None:
+                return step_error_rate(current_time, dt, order)
+            return self._adaptive_split_error_rate(
+                current_time, dt, order, step_propagator
+            )
+
         direction = 1 if stop_tick > start_tick else -1
         current_tick = start_tick
         step_ticks = []
@@ -1319,9 +1327,7 @@ class DysolvePropagator:
             while candidate_tick >= 1:
                 dt = direction * candidate_tick * self.min_timestep
                 current_time = current_tick * self.min_timestep
-                error_rate = self._adaptive_split_error_rate(
-                    current_time, dt, order, step_propagator
-                )
+                error_rate = evaluate_step_error(current_time, dt)
                 if error_rate <= self.error_tolerance_per_time:
                     accepted_tick = candidate_tick
                     break
@@ -1334,9 +1340,7 @@ class DysolvePropagator:
             while accepted_tick_hint is not None and larger_tick <= remaining_ticks:
                 dt = direction * larger_tick * self.min_timestep
                 current_time = current_tick * self.min_timestep
-                error_rate = self._adaptive_split_error_rate(
-                    current_time, dt, order, step_propagator
-                )
+                error_rate = evaluate_step_error(current_time, dt)
                 if not error_rate <= self.error_tolerance_per_time:
                     break
                 accepted_tick = larger_tick
@@ -1355,6 +1359,8 @@ class DysolvePropagator:
         t_i: float,
         t_f: float,
         step_propagator: Callable[[float, float, int], ArrayLike] = None,
+        *,
+        order_error_rate: Callable[[float, float, int], float] = None,
     ) -> tuple[int, tuple[int, ...]]:
         """Select a Dyson order and dyadic step plan for one interval."""
         start_tick = round(float(t_i) / self.min_timestep)
@@ -1364,6 +1370,7 @@ class DysolvePropagator:
 
         escalation_thresholds = {1: 1000, 2: 200, 3: 100}
         fallback_orders = []
+        selected_plan = None
         for order in range(1, self.max_order + 1):
             piece_limit = (
                 escalation_thresholds.get(order)
@@ -1376,27 +1383,48 @@ class DysolvePropagator:
                 order,
                 piece_limit,
                 step_propagator,
+                order_error_rate,
             )
             if step_ticks is None:
                 continue
             fallback_orders.append(order)
             if piece_limit is None or len(step_ticks) <= piece_limit:
-                return order, step_ticks
+                selected_plan = (order, step_ticks)
+                break
 
-        for fallback_order in reversed(fallback_orders):
+        if selected_plan is None:
+            for fallback_order in reversed(fallback_orders):
+                step_ticks = self._adaptive_plan_for_order(
+                    start_tick,
+                    stop_tick,
+                    fallback_order,
+                    step_propagator=step_propagator,
+                    step_error_rate=order_error_rate,
+                )
+                if step_ticks is not None:
+                    selected_plan = (fallback_order, step_ticks)
+                    break
+
+        if selected_plan is None:
+            raise ValueError(
+                "Requested error_tolerance_per_time cannot be met with "
+                "max_order and min_timestep"
+            )
+
+        order, step_ticks = selected_plan
+        if order_error_rate is not None:
             step_ticks = self._adaptive_plan_for_order(
                 start_tick,
                 stop_tick,
-                fallback_order,
+                order,
                 step_propagator=step_propagator,
             )
-            if step_ticks is not None:
-                return fallback_order, step_ticks
-
-        raise ValueError(
-            "Requested error_tolerance_per_time cannot be met with "
-            "max_order and min_timestep"
-        )
+            if step_ticks is None:
+                raise ValueError(
+                    "Requested error_tolerance_per_time cannot be met with "
+                    "max_order and min_timestep"
+                )
+        return order, step_ticks
 
     def _compute_interval(
         self,

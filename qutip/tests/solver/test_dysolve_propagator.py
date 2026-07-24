@@ -847,6 +847,50 @@ def test_adaptive_order_escalates_by_piece_count(monkeypatch):
     assert set(step_ticks) == {16}
 
 
+def test_adaptive_envelope_piece_count_does_not_escalate_dyson_order(
+    monkeypatch,
+):
+    dysolve = DysolvePropagator(
+        sigmaz(),
+        sigmax(),
+        1,
+        options={
+            'min_timestep': 1.0,
+            'error_tolerance_per_time': 1.0,
+            'max_order': 4,
+        },
+    )
+    order_checks = []
+
+    def interpolation_error_rate(
+        self, current_time, dt, order, step_propagator=None
+    ):
+        del self, current_time, order, step_propagator
+        return 0.0 if abs(dt) <= 1.0 else 2.0
+
+    def dyson_error_rate(current_time, dt, order):
+        del current_time, dt
+        order_checks.append(order)
+        return 0.0
+
+    monkeypatch.setattr(
+        DysolvePropagator,
+        "_adaptive_split_error_rate",
+        interpolation_error_rate,
+    )
+    order, step_ticks = dysolve._adaptive_interval_plan(
+        0.0,
+        1001.0,
+        lambda current_time, dt, order: np.eye(2),
+        order_error_rate=dyson_error_rate,
+    )
+
+    assert order == 1
+    assert len(step_ticks) == 1001
+    assert set(step_ticks) == {1}
+    assert set(order_checks) == {1}
+
+
 def test_adaptive_rejects_one_tick_when_split_check_fails(monkeypatch):
     dysolve = DysolvePropagator(
         sigmaz(), sigmax(), 1,
