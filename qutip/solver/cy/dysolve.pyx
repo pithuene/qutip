@@ -101,14 +101,89 @@ cpdef object cy_compute_integral_frequency_derivatives(
     return derivatives_arr
 
 
+cdef double complex _compute_moment_integral_series(
+    double[:] frequencies,
+    long derivative_subset,
+    double dt,
+):
+    """Evaluate short-step moments as a series in ``frequency * dt``.
+
+    The general polynomial-exponential recurrence contains terms divided by
+    frequency sums which are subtracted again at the integration boundaries.
+    When ``abs(frequency * dt)`` is small, those individually large terms are
+    nearly equal even though their final difference is proportional to a high
+    power of ``dt``. Floating-point subtraction then loses the significant
+    digits of the physical result (catastrophic cancellation).
+
+    Rescaling every integration time as ``t = dt * x`` factors the exact
+    ``dt ** (Dyson order + number of time factors)`` dependence out first.
+    Expanding the remaining exponentials in the dimensionless variables
+    ``frequency * dt`` evaluates only naturally scaled terms on ``0 <= x <= 1``
+    and therefore remains accurate as ``dt`` approaches the timing-grid floor.
+    """
+    cdef int max_degree = 48
+    cdef Py_ssize_t order = frequencies.shape[0]
+    cdef Py_ssize_t position, exponential_degree, current_degree
+    cdef Py_ssize_t selected_count = 0
+    cdef Py_ssize_t integrated_power
+    cdef double complex exponential_term, result
+    cdef double scale = 1.
+    cdef object current_arr = np.zeros(max_degree + 1, dtype=np.complex128)
+    cdef object next_arr = np.zeros(max_degree + 1, dtype=np.complex128)
+    cdef double complex[:] current = current_arr
+    cdef double complex[:] next_coefficients = next_arr
+
+    current[0] = 1.
+    for position in range(order):
+        if derivative_subset & (1 << position):
+            selected_count += 1
+        integrated_power = position + 1 + selected_count
+        next_arr.fill(0.)
+        exponential_term = 1.
+        for exponential_degree in range(max_degree + 1):
+            if exponential_degree > 0:
+                exponential_term *= (
+                    1j * frequencies[position] * dt / exponential_degree
+                )
+            for current_degree in range(
+                max_degree - exponential_degree + 1
+            ):
+                next_coefficients[current_degree + exponential_degree] += (
+                    current[current_degree]
+                    * exponential_term
+                    / (
+                        integrated_power
+                        + current_degree
+                        + exponential_degree
+                    )
+                )
+        for current_degree in range(max_degree + 1):
+            current[current_degree] = next_coefficients[current_degree]
+
+    result = 0.
+    for current_degree in range(max_degree + 1):
+        result += current[current_degree]
+    for position in range(order + selected_count):
+        scale *= dt
+    return scale * result
+
+
 cdef double complex _compute_moment_integral(
     double[:] frequencies,
     long derivative_subset,
     double dt,
     double a_tol,
 ):
-    """Integrate selected time factors with nested exponentials."""
+    """Integrate selected time factors with nested exponentials.
+
+    Short steps use the dimensionless series above because direct boundary
+    cancellation is ill-conditioned there. Longer steps use the more compact
+    polynomial-exponential recurrence, where the boundary terms are separated
+    enough for stable floating-point subtraction.
+    """
     cdef Py_ssize_t order = frequencies.shape[0]
+    cdef Py_ssize_t scaled_frequency_index
+    cdef double max_scaled_frequency = 0.
     cdef Py_ssize_t position, term_index, coefficient_index, search_index
     cdef Py_ssize_t current_count = 1
     cdef Py_ssize_t next_count, polynomial_degree, integrated_degree
@@ -133,6 +208,18 @@ cdef double complex _compute_moment_integral(
     cdef object next_degrees_arr = np.zeros(order + 1, dtype=np.int_)
     cdef long[:] current_degrees = current_degrees_arr
     cdef long[:] next_degrees = next_degrees_arr
+
+    for scaled_frequency_index in range(order):
+        combined_frequency = abs(
+            frequencies[scaled_frequency_index] * dt
+        )
+        if combined_frequency > max_scaled_frequency:
+            max_scaled_frequency = combined_frequency
+    # Avoid subtracting nearly equal exponential boundary terms on short steps.
+    if max_scaled_frequency <= 2.:
+        return _compute_moment_integral_series(
+            frequencies, derivative_subset, dt
+        )
 
     current_polynomials[0, 0] = 1.
     for position in range(order):

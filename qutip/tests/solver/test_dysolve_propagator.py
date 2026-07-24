@@ -670,6 +670,28 @@ def test_Sn_frequency_derivative_subsets_handle_zero_frequencies():
     )
 
 
+def test_Sn_frequency_derivative_subsets_are_stable_for_short_steps():
+    dt = 1e-7
+    subsets = cy_compute_Sn_frequency_derivative_subsets(
+        np.array([[18000.0, -18000.0]]),
+        np.array([[0, 0]], dtype=int),
+        np.zeros((1, 2)),
+        np.ones(1, dtype=complex),
+        dt,
+        1,
+        1e-12,
+    )
+    magnitude_bounds = np.array([
+        dt**2 / 2,
+        dt**3 / 6,
+        dt**3 / 3,
+        dt**4 / 8,
+    ])
+
+    assert np.all(np.isfinite(subsets))
+    assert np.all(np.abs(subsets[0, :, 0, 0]) <= 1.001 * magnitude_bounds)
+
+
 def test_frequency_derivative_tensors_are_cached_lazily():
     solver = DysolvePropagator(
         0.31 * sigmaz(),
