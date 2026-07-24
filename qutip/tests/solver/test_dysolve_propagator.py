@@ -151,6 +151,48 @@ def test_linear_envelope_subpropagator_improves_smooth_drive_accuracy():
     assert linear_error < midpoint_error / 100
 
 
+def test_linear_envelope_endpoint_gradients_match_finite_difference():
+    dt = 0.04
+    start_amplitudes = np.array([0.1 + 0.05j, -0.2 + 0.1j])
+    end_amplitudes = np.array([0.9 - 0.25j, 0.3 + 0.2j])
+    solver = DysolvePropagator.from_drives(
+        0.31 * sigmaz(),
+        [(0.19 * sigmax(), 1.3), (0.13 * sigmay(), 1.9)],
+        options=_adaptive_options(dt, max_order=3),
+    )
+
+    _, *endpoint_gradients = solver._compute_linear_envelope_subpropagator(
+        start_amplitudes,
+        end_amplitudes,
+        dt,
+        0.17,
+        max_order=3,
+        gradient=True,
+    )
+    epsilon = 1e-6
+    for endpoint_index in range(2):
+        for quadrature_index, direction in enumerate((1.0, 1j)):
+            for drive_index in range(2):
+                plus = [start_amplitudes.copy(), end_amplitudes.copy()]
+                minus = [start_amplitudes.copy(), end_amplitudes.copy()]
+                plus[endpoint_index][drive_index] += epsilon * direction
+                minus[endpoint_index][drive_index] -= epsilon * direction
+                finite_difference = (
+                    solver._compute_linear_envelope_subpropagator(
+                        *plus, dt, 0.17, max_order=3
+                    )
+                    - solver._compute_linear_envelope_subpropagator(
+                        *minus, dt, 0.17, max_order=3
+                    )
+                ) / (2 * epsilon)
+                actual = endpoint_gradients[
+                    2 * endpoint_index + quadrature_index
+                ][drive_index]
+                np.testing.assert_allclose(
+                    actual, finite_difference, rtol=1e-8, atol=2e-9
+                )
+
+
 def test_envelope_propagator_real_gradient_matches_finite_difference():
     dt = 0.02
     amplitudes = np.array([0.7, -0.2, 0.4])

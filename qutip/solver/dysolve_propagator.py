@@ -759,10 +759,17 @@ class DysolvePropagator:
         t0: float = 0.0,
         *,
         max_order: int = None,
-    ) -> ArrayLike:
-        """Propagate one subpixel with an exactly linear drive envelope."""
+        gradient: bool = False,
+    ) -> ArrayLike | tuple[ArrayLike, ...]:
+        """Propagate one linear subpixel and optionally its endpoint gradients."""
         if dt == 0.0:
-            return np.eye(len(self._eigenenergies), dtype=np.complex128)
+            identity = np.eye(len(self._eigenenergies), dtype=np.complex128)
+            if not gradient:
+                return identity
+            zero_gradient = np.zeros(
+                (self._n_drives, *identity.shape), dtype=np.complex128
+            )
+            return identity, *(zero_gradient.copy() for _ in range(4))
         if max_order is None:
             max_order = self.max_order
         if max_order < 0 or max_order > self.max_order:
@@ -780,6 +787,10 @@ class DysolvePropagator:
         slopes = (end_amplitudes - start_amplitudes) / dt
         length = len(self._eigenenergies)
         subpropagator = self._compute_Sn(dt, 0).copy()
+        if gradient:
+            endpoint_gradients = np.zeros(
+                (4, self._n_drives, length, length), dtype=np.complex128
+            )
 
         for order in range(1, max_order + 1):
             drive_indices, signs, _ = self._get_branch_metadata(order)
@@ -808,20 +819,70 @@ class DysolvePropagator:
             derivative_subsets = self._compute_Sn_frequency_derivative_subsets(
                 dt, order
             )
+            branch_indices = np.arange(n_branches)
+            quadrature_derivatives = np.where(signs > 0, -1j, 1j)
             for subset in range(1 << order):
-                coefficients = np.ones(n_branches, dtype=np.complex128)
-                for position in range(order):
-                    if subset & (1 << position):
-                        coefficients *= -1j * branch_slopes[:, position]
-                    else:
-                        coefficients *= branch_starts[:, position]
+                values_by_position = [
+                    -1j * branch_slopes[:, position]
+                    if subset & (1 << position)
+                    else branch_starts[:, position]
+                    for position in range(order)
+                ]
+                coefficients = np.prod(values_by_position, axis=0)
+                subset_tensor = derivative_subsets[:, subset]
                 subpropagator += np.tensordot(
-                    phases * coefficients,
-                    derivative_subsets[:, subset],
-                    axes=(0, 0),
+                    phases * coefficients, subset_tensor, axes=(0, 0)
+                )
+                if not gradient:
+                    continue
+
+                coefficient_gradients = np.zeros(
+                    (4, self._n_drives, n_branches), dtype=np.complex128
+                )
+                for position in range(order):
+                    product_except_position = np.ones(
+                        n_branches, dtype=np.complex128
+                    )
+                    for other_position, values in enumerate(
+                        values_by_position
+                    ):
+                        if other_position != position:
+                            product_except_position *= values
+                    quadrature_derivative = quadrature_derivatives[:, position]
+                    if subset & (1 << position):
+                        derivative_values = (
+                            1j * product_except_position / dt,
+                            1j * quadrature_derivative
+                            * product_except_position
+                            / dt,
+                            -1j * product_except_position / dt,
+                            -1j * quadrature_derivative
+                            * product_except_position
+                            / dt,
+                        )
+                    else:
+                        derivative_values = (
+                            product_except_position,
+                            quadrature_derivative * product_except_position,
+                            np.zeros(n_branches),
+                            np.zeros(n_branches),
+                        )
+                    position_drives = drive_indices[:, position]
+                    for endpoint_index, derivative_value in enumerate(
+                        derivative_values
+                    ):
+                        coefficient_gradients[
+                            endpoint_index, position_drives, branch_indices
+                        ] += derivative_value
+                endpoint_gradients += np.tensordot(
+                    coefficient_gradients * phases,
+                    subset_tensor,
+                    axes=(2, 0),
                 )
 
         assert subpropagator.shape == (length, length)
+        if gradient:
+            return subpropagator, *endpoint_gradients
         return subpropagator
 
     def prepare_envelope(self, amplitudes: ArrayLike, dt: float) -> PreparedDysolveEnvelope:
