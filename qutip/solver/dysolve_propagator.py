@@ -172,9 +172,9 @@ class DysolvePropagator:
     complex amplitudes represent I/Q quadratures.  Gaussian-filtered optimizer
     pixels are supported by :meth:`filtered_envelope_propagator`.
 
-    More general perturbations described in the Dysolve paper, such as
-    arbitrary modulation functions or linear interpolation within subpixels,
-    are not implemented.
+    Adaptive envelopes use integral-preserving linear interpolation within
+    each selected subpixel. General arbitrary modulation functions described
+    in the Dysolve paper are not implemented.
 
     .. note:: Experimental.
 
@@ -1133,6 +1133,82 @@ class DysolvePropagator:
             interior.reverse()
         return (float(t_i), *interior, float(t_f))
 
+    @staticmethod
+    def _adaptive_envelope_sample_times(
+        current_time: float, dt: float
+    ) -> ArrayLike:
+        """Sample a subpixel midpoint and both one-sided boundaries."""
+        end_time = current_time + dt
+        return np.asarray([
+            np.nextafter(current_time, end_time),
+            current_time + dt / 2,
+            np.nextafter(end_time, current_time),
+        ])
+
+    @staticmethod
+    def _integral_preserving_linear_endpoints(
+        samples: ArrayLike,
+    ) -> tuple[ArrayLike, ArrayLike]:
+        """Return linear endpoints whose mean equals the midpoint sample."""
+        sample_delta = samples[..., 2] - samples[..., 0]
+        return (
+            samples[..., 1] - sample_delta / 2,
+            samples[..., 1] + sample_delta / 2,
+        )
+
+    def _compute_adaptive_linear_envelope_step(
+        self,
+        amplitude: Callable[[ArrayLike], ArrayLike],
+        current_time: float,
+        dt: float,
+        order: int,
+    ) -> ArrayLike:
+        """Propagate one adaptive integral-preserving linear subpixel."""
+        amplitudes = self._as_drive_amplitudes(
+            amplitude(self._adaptive_envelope_sample_times(current_time, dt))
+        )
+        linear_start, linear_end = self._integral_preserving_linear_endpoints(
+            amplitudes
+        )
+        if np.array_equal(linear_start, linear_end):
+            return self._compute_envelope_subprops(
+                linear_start[:, None],
+                dt,
+                current_time,
+                max_order=order,
+            )[0]
+        return self._compute_linear_envelope_subpropagator(
+            linear_start,
+            linear_end,
+            dt,
+            current_time,
+            max_order=order,
+        )
+
+    def _adaptive_frozen_envelope_split_error_rate(
+        self,
+        amplitude: Callable[[ArrayLike], ArrayLike],
+        current_time: float,
+        dt: float,
+        order: int,
+    ) -> float:
+        """Estimate Dyson error with the local envelope value held fixed."""
+        amplitudes = self._as_drive_amplitudes(
+            amplitude(np.asarray([current_time + dt / 2]))
+        )
+
+        def frozen_step(step_time, step_dt, selected_order):
+            return self._compute_envelope_subprops(
+                amplitudes,
+                step_dt,
+                step_time,
+                max_order=selected_order,
+            )[0]
+
+        return self._adaptive_split_error_rate(
+            current_time, dt, order, frozen_step
+        )
+
     def adaptive_envelope_propagator(
         self,
         amplitude: Callable[[ArrayLike], ArrayLike],
@@ -1143,14 +1219,14 @@ class DysolvePropagator:
     ) -> Qobj:
         """Propagate an absolute-time amplitude envelope adaptively."""
         def step_propagator(current_time, dt, order):
-            sample_times = np.asarray([current_time + dt / 2])
-            amplitudes = amplitude(sample_times)
-            return self._compute_envelope_subprops(
-                amplitudes,
-                dt,
-                current_time,
-                max_order=order,
-            )[0]
+            return self._compute_adaptive_linear_envelope_step(
+                amplitude, current_time, dt, order
+            )
+
+        def order_error_rate(current_time, dt, order):
+            return self._adaptive_frozen_envelope_split_error_rate(
+                amplitude, current_time, dt, order
+            )
 
         propagator = np.eye(len(self._eigenenergies), dtype=np.complex128)
         boundaries = self._adaptive_boundaries(t_i, t_f, breakpoints)
@@ -1158,7 +1234,10 @@ class DysolvePropagator:
             boundaries[:-1], boundaries[1:], strict=True
         ):
             order, step_ticks = self._adaptive_interval_plan(
-                interval_start, interval_end, step_propagator
+                interval_start,
+                interval_end,
+                step_propagator,
+                order_error_rate=order_error_rate,
             )
             current_tick = round(interval_start / self.min_timestep)
             for step_tick in step_ticks:
@@ -1183,14 +1262,14 @@ class DysolvePropagator:
     ) -> tuple[Qobj, tuple[Qobj, ...]]:
         """Propagate an envelope and its parameter derivatives adaptively."""
         def step_propagator(current_time, dt, order):
-            sample_times = np.asarray([current_time + dt / 2])
-            amplitudes = amplitude(sample_times)
-            return self._compute_envelope_subprops(
-                amplitudes,
-                dt,
-                current_time,
-                max_order=order,
-            )[0]
+            return self._compute_adaptive_linear_envelope_step(
+                amplitude, current_time, dt, order
+            )
+
+        def order_error_rate(current_time, dt, order):
+            return self._adaptive_frozen_envelope_split_error_rate(
+                amplitude, current_time, dt, order
+            )
 
         propagator = np.eye(len(self._eigenenergies), dtype=np.complex128)
         propagator_gradients = None
@@ -1199,7 +1278,10 @@ class DysolvePropagator:
             boundaries[:-1], boundaries[1:], strict=True
         ):
             order, step_ticks = self._adaptive_interval_plan(
-                interval_start, interval_end, step_propagator
+                interval_start,
+                interval_end,
+                step_propagator,
+                order_error_rate=order_error_rate,
             )
             if not step_ticks:
                 continue
@@ -1207,27 +1289,39 @@ class DysolvePropagator:
             for step_tick in step_ticks:
                 current_time = current_tick * self.min_timestep
                 dt = step_tick * self.min_timestep
-                sample_times = np.asarray([current_time + dt / 2])
-                amplitudes = amplitude(sample_times)
-                step_data = self._compute_envelope_subprops(
-                    amplitudes,
+                sample_times = self._adaptive_envelope_sample_times(
+                    current_time, dt
+                )
+                amplitudes = self._as_drive_amplitudes(amplitude(sample_times))
+                linear_start, linear_end = (
+                    self._integral_preserving_linear_endpoints(amplitudes)
+                )
+                step_data = self._compute_linear_envelope_subpropagator(
+                    linear_start,
+                    linear_end,
                     dt,
                     current_time,
-                    gradient=True,
                     max_order=order,
+                    gradient=True,
                 )
-                step_propagator_matrix, step_gradients_x, step_gradients_y = (
-                    step_data
-                )
-                step_propagator_matrix = step_propagator_matrix[0]
+                (
+                    step_propagator_matrix,
+                    start_gradients_x,
+                    start_gradients_y,
+                    end_gradients_x,
+                    end_gradients_y,
+                ) = step_data
 
                 derivatives = np.asarray(
                     amplitude_derivatives(sample_times), dtype=np.complex128
                 )
                 if self._n_drives == 1 and derivatives.ndim == 2:
                     derivatives = derivatives[:, None, :]
-                expected_shape = (self._n_drives, 1)
-                if derivatives.ndim != 3 or derivatives.shape[1:] != expected_shape:
+                expected_shape = (self._n_drives, 3)
+                if (
+                    derivatives.ndim != 3
+                    or derivatives.shape[1:] != expected_shape
+                ):
                     raise ValueError(
                         "amplitude_derivatives must have shape "
                         "(n_parameters, n_drives, n_times)"
@@ -1238,13 +1332,31 @@ class DysolvePropagator:
                         dtype=np.complex128,
                     )
 
-                step_parameter_gradients = np.zeros_like(propagator_gradients)
-                for parameter_index, parameter_derivatives in enumerate(derivatives):
-                    for drive_index, derivative in enumerate(parameter_derivatives[:, 0]):
-                        step_parameter_gradients[parameter_index] += (
-                            derivative.real * step_gradients_x[drive_index, 0]
-                            + derivative.imag * step_gradients_y[drive_index, 0]
-                        )
+                linear_start_derivatives, linear_end_derivatives = (
+                    self._integral_preserving_linear_endpoints(derivatives)
+                )
+                step_parameter_gradients = (
+                    np.tensordot(
+                        linear_start_derivatives.real,
+                        start_gradients_x,
+                        axes=(1, 0),
+                    )
+                    + np.tensordot(
+                        linear_start_derivatives.imag,
+                        start_gradients_y,
+                        axes=(1, 0),
+                    )
+                    + np.tensordot(
+                        linear_end_derivatives.real,
+                        end_gradients_x,
+                        axes=(1, 0),
+                    )
+                    + np.tensordot(
+                        linear_end_derivatives.imag,
+                        end_gradients_y,
+                        axes=(1, 0),
+                    )
+                )
 
                 previous_propagator = propagator
                 propagator = step_propagator_matrix @ previous_propagator

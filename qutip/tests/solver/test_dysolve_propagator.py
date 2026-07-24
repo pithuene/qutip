@@ -193,6 +193,17 @@ def test_linear_envelope_endpoint_gradients_match_finite_difference():
                 )
 
 
+def test_integral_preserving_linear_endpoints_keep_midpoint_average():
+    linear_start, linear_end = (
+        DysolvePropagator._integral_preserving_linear_endpoints(
+            np.array([[0.0, 1.0, 4.0]])
+        )
+    )
+
+    np.testing.assert_allclose((linear_start + linear_end) / 2, [1.0])
+    np.testing.assert_allclose(linear_end - linear_start, [4.0])
+
+
 def test_envelope_propagator_real_gradient_matches_finite_difference():
     dt = 0.02
     amplitudes = np.array([0.7, -0.2, 0.4])
@@ -1050,6 +1061,7 @@ def test_adaptive_constant_envelope_matches_constant_drive():
     np.testing.assert_allclose(
         _qobj_data(shaped), _qobj_data(constant), rtol=1e-12, atol=1e-12
     )
+    assert not dysolve._dt_Sn_frequency_derivative_subsets
 
 
 def test_adaptive_shaped_envelope_matches_fine_reference():
@@ -1082,6 +1094,96 @@ def test_adaptive_shaped_envelope_matches_fine_reference():
     )
 
     assert (actual - expected).norm() < 2e-7
+
+
+def test_adaptive_smooth_envelope_avoids_dyson_order_escalation(
+    monkeypatch,
+):
+    start = 0.017
+    duration = 0.12
+    dysolve = DysolvePropagator(
+        1000 * sigmaz(),
+        1e5 * sigmax(),
+        2000,
+        options=_adaptive_options(
+            1e-5,
+            max_order=4,
+            error_tolerance_per_time=1e-4,
+        ),
+    )
+    selected_plans = []
+    adaptive_interval_plan = dysolve._adaptive_interval_plan
+
+    def record_plan(*args, **kwargs):
+        plan = adaptive_interval_plan(*args, **kwargs)
+        selected_plans.append(plan)
+        return plan
+
+    monkeypatch.setattr(dysolve, "_adaptive_interval_plan", record_plan)
+
+    def amplitude(times):
+        tau = (np.asarray(times) - start) / duration
+        return 10e-6 * (1 - np.cos(2 * np.pi * tau)) / 2
+
+    dysolve.adaptive_envelope_propagator(
+        amplitude, start + duration, start
+    )
+
+    assert len(selected_plans) == 1
+    order, step_ticks = selected_plans[0]
+    assert order == 1
+    assert len(step_ticks) < 300
+
+
+def test_adaptive_envelope_respects_discontinuous_breakpoints():
+    start = 0.037
+    breakpoint = 0.137
+    end = 0.237
+    first_amplitude = 0.2 + 0.1j
+    second_amplitude = 0.8 - 0.2j
+    dysolve = DysolvePropagator(
+        0.7 * sigmaz(),
+        0.35 * sigmax(),
+        5.0,
+        options=_adaptive_options(
+            0.001,
+            max_order=4,
+            error_tolerance_per_time=1e-5,
+        ),
+    )
+
+    def amplitude(times):
+        return np.where(
+            np.asarray(times) < breakpoint,
+            first_amplitude,
+            second_amplitude,
+        )
+
+    actual = dysolve.adaptive_envelope_propagator(
+        amplitude,
+        end,
+        start,
+        breakpoints=[breakpoint],
+    )
+    first = dysolve.adaptive_envelope_propagator(
+        lambda times: np.full_like(times, first_amplitude, dtype=complex),
+        breakpoint,
+        start,
+    )
+    second = dysolve.adaptive_envelope_propagator(
+        lambda times: np.full_like(times, second_amplitude, dtype=complex),
+        end,
+        breakpoint,
+    )
+    backward = dysolve.adaptive_envelope_propagator(
+        amplitude,
+        start,
+        end,
+        breakpoints=[breakpoint],
+    )
+
+    assert (actual - second * first).norm() < 1e-12
+    assert (backward - actual.dag()).norm() < 2e-7
 
 
 def test_adaptive_envelope_parameter_gradients_match_finite_difference():
