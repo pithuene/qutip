@@ -9,9 +9,10 @@ from qutip.solver.cy.dysolve import (
     cy_compute_integral_frequency_derivatives,
     cy_compute_Sn,
     cy_compute_Sn_frequency_derivatives,
+    cy_compute_Sn_frequency_derivative_subsets,
 )
 from qutip import (
-    CoreOptions, sigmax, sigmay, sigmaz, qeye,
+    CoreOptions, Qobj, sigmax, sigmay, sigmaz, qeye,
     qeye_like, tensor, enr_destroy,
 )
 from scipy.linalg import expm_frechet
@@ -71,6 +72,83 @@ def test_prepared_envelope_matches_direct_subpropagator_contraction():
             atol=1e-12,
         )
 
+
+
+def test_linear_envelope_subpropagator_matches_constant_envelope():
+    dt = 0.04
+    t0 = 0.17
+    amplitude = 0.7 + 0.2j
+    solver = DysolvePropagator(
+        0.31 * sigmaz(),
+        0.19 * sigmax(),
+        1.3,
+        options=_adaptive_options(dt, max_order=3),
+    )
+
+    linear = solver._compute_linear_envelope_subpropagator(
+        amplitude,
+        amplitude,
+        dt,
+        t0,
+        max_order=3,
+    )
+    constant = solver._compute_envelope_subprops(
+        np.array([amplitude]),
+        dt,
+        t0,
+        max_order=3,
+    )[0]
+
+    np.testing.assert_allclose(linear, constant, rtol=1e-13, atol=1e-13)
+
+
+def test_linear_envelope_subpropagator_improves_smooth_drive_accuracy():
+    H_0 = 0.31 * sigmaz()
+    drive_operator = 0.19 * sigmax()
+    omega = 1.3
+    dt = 0.3
+    start_amplitude = 0.1 + 0.05j
+    end_amplitude = 0.9 - 0.25j
+    solver = DysolvePropagator(
+        H_0,
+        drive_operator,
+        omega,
+        options=_adaptive_options(dt, max_order=4),
+    )
+
+    linear_data = solver._compute_linear_envelope_subpropagator(
+        start_amplitude,
+        end_amplitude,
+        dt,
+        max_order=4,
+    )
+    midpoint_data = solver._compute_envelope_subprops(
+        np.array([(start_amplitude + end_amplitude) / 2]),
+        dt,
+        max_order=4,
+    )[0]
+    linear = Qobj(linear_data, H_0.dims, copy=False).transform(
+        solver._basis, True
+    )
+    midpoint = Qobj(midpoint_data, H_0.dims, copy=False).transform(
+        solver._basis, True
+    )
+
+    def coefficient(time, _=None):
+        amplitude = start_amplitude + (end_amplitude - start_amplitude) * time / dt
+        return amplitude.real * np.cos(omega * time) + amplitude.imag * np.sin(omega * time)
+
+    reference = propagator(
+        [H_0, [drive_operator, coefficient]],
+        dt,
+        args={},
+        options={"atol": 1e-13, "rtol": 1e-13},
+    )
+    linear_error = np.linalg.norm(_qobj_data(linear - reference))
+    midpoint_error = np.linalg.norm(_qobj_data(midpoint - reference))
+
+    assert linear_error < 1e-7
+    assert linear_error < midpoint_error / 100
 
 
 def test_envelope_propagator_real_gradient_matches_finite_difference():
@@ -485,6 +563,69 @@ def test_Sn_frequency_derivatives_match_finite_difference():
         np.testing.assert_allclose(
             actual[:, frequency_index], expected, rtol=2e-6, atol=1e-9
         )
+
+
+def test_Sn_frequency_derivative_subsets_include_base_and_singletons():
+    omega_vectors = np.array([[0.7, 1.2], [-0.7, 1.2]])
+    ket_bra_indices = np.array([[0, 1], [1, 0]], dtype=int)
+    diff_lambdas = np.array([[0.11, -0.23], [-0.19, 0.31]])
+    matrix_elements = np.array([0.4 + 0.2j, -0.1 + 0.3j])
+    dt = 0.4
+    subsets = cy_compute_Sn_frequency_derivative_subsets(
+        omega_vectors,
+        ket_bra_indices,
+        diff_lambdas,
+        matrix_elements,
+        dt,
+        2,
+        1e-12,
+    )
+    base = cy_compute_Sn(
+        omega_vectors,
+        ket_bra_indices,
+        diff_lambdas,
+        matrix_elements,
+        dt,
+        2,
+        1e-12,
+    )
+    first_derivatives = cy_compute_Sn_frequency_derivatives(
+        omega_vectors,
+        ket_bra_indices,
+        diff_lambdas,
+        matrix_elements,
+        dt,
+        2,
+        1e-12,
+    )
+
+    np.testing.assert_allclose(subsets[:, 0], base, rtol=1e-13, atol=1e-13)
+    np.testing.assert_allclose(
+        subsets[:, 1], first_derivatives[:, 0], rtol=1e-13, atol=1e-13
+    )
+    np.testing.assert_allclose(
+        subsets[:, 2], first_derivatives[:, 1], rtol=1e-13, atol=1e-13
+    )
+
+
+def test_Sn_frequency_derivative_subsets_handle_zero_frequencies():
+    dt = 0.3
+    subsets = cy_compute_Sn_frequency_derivative_subsets(
+        np.zeros((1, 2)),
+        np.array([[0, 0]], dtype=int),
+        np.zeros((1, 2)),
+        np.ones(1, dtype=complex),
+        dt,
+        1,
+        1e-12,
+    )
+
+    np.testing.assert_allclose(
+        subsets[0, :, 0, 0],
+        [dt**2 / 2, 1j * dt**3 / 6, 1j * dt**3 / 3, -(dt**4) / 8],
+        rtol=1e-13,
+        atol=1e-13,
+    )
 
 
 def test_frequency_derivative_tensors_are_cached_lazily():

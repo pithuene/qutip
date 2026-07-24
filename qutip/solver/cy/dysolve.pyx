@@ -101,6 +101,137 @@ cpdef object cy_compute_integral_frequency_derivatives(
     return derivatives_arr
 
 
+cdef double complex _compute_moment_integral(
+    double[:] frequencies,
+    long derivative_subset,
+    double dt,
+    double a_tol,
+):
+    """Integrate selected time factors with nested exponentials."""
+    cdef Py_ssize_t order = frequencies.shape[0]
+    cdef Py_ssize_t position, term_index, coefficient_index, search_index
+    cdef Py_ssize_t current_count = 1
+    cdef Py_ssize_t next_count, polynomial_degree, integrated_degree
+    cdef Py_ssize_t zero_term_index
+    cdef bint include_time
+    cdef double combined_frequency
+    cdef double complex boundary_constant
+    cdef double complex polynomial_value
+    cdef object current_frequencies_arr = np.zeros(order + 1, dtype=float)
+    cdef object next_frequencies_arr = np.zeros(order + 1, dtype=float)
+    cdef double[:] current_frequencies = current_frequencies_arr
+    cdef double[:] next_frequencies = next_frequencies_arr
+    cdef object current_polynomials_arr = np.zeros(
+        (order + 1, 2 * order + 1), dtype=np.complex128
+    )
+    cdef object next_polynomials_arr = np.zeros(
+        (order + 1, 2 * order + 1), dtype=np.complex128
+    )
+    cdef double complex[:, :] current_polynomials = current_polynomials_arr
+    cdef double complex[:, :] next_polynomials = next_polynomials_arr
+    cdef object current_degrees_arr = np.zeros(order + 1, dtype=np.int_)
+    cdef object next_degrees_arr = np.zeros(order + 1, dtype=np.int_)
+    cdef long[:] current_degrees = current_degrees_arr
+    cdef long[:] next_degrees = next_degrees_arr
+
+    current_polynomials[0, 0] = 1.
+    for position in range(order):
+        include_time = (derivative_subset & (1 << position)) != 0
+        next_count = 0
+        boundary_constant = 0.
+        next_polynomials_arr.fill(0.)
+        next_degrees_arr.fill(0)
+        for term_index in range(current_count):
+            combined_frequency = (
+                current_frequencies[term_index] + frequencies[position]
+            )
+            polynomial_degree = current_degrees[term_index] + include_time
+            if abs(combined_frequency) < a_tol:
+                zero_term_index = -1
+                for search_index in range(next_count):
+                    if abs(next_frequencies[search_index]) < a_tol:
+                        zero_term_index = search_index
+                        break
+                if zero_term_index < 0:
+                    zero_term_index = next_count
+                    next_frequencies[next_count] = 0.
+                    next_count += 1
+                integrated_degree = polynomial_degree + 1
+                if integrated_degree > next_degrees[zero_term_index]:
+                    next_degrees[zero_term_index] = integrated_degree
+                for coefficient_index in range(polynomial_degree + 1):
+                    if coefficient_index >= include_time:
+                        next_polynomials[
+                            zero_term_index, coefficient_index + 1
+                        ] += (
+                            current_polynomials[
+                                term_index, coefficient_index - include_time
+                            ]
+                            / (coefficient_index + 1)
+                        )
+            else:
+                next_frequencies[next_count] = combined_frequency
+                next_degrees[next_count] = polynomial_degree
+                next_polynomials[next_count, polynomial_degree] = (
+                    current_polynomials[
+                        term_index, polynomial_degree - include_time
+                    ]
+                    / (1j * combined_frequency)
+                )
+                for coefficient_index in range(
+                    polynomial_degree - 1, -1, -1
+                ):
+                    polynomial_value = 0.
+                    if coefficient_index >= include_time:
+                        polynomial_value = current_polynomials[
+                            term_index, coefficient_index - include_time
+                        ]
+                    next_polynomials[next_count, coefficient_index] = (
+                        polynomial_value
+                        - (coefficient_index + 1)
+                        * next_polynomials[next_count, coefficient_index + 1]
+                    ) / (1j * combined_frequency)
+                boundary_constant -= next_polynomials[next_count, 0]
+                next_count += 1
+
+        if boundary_constant != 0.:
+            zero_term_index = -1
+            for search_index in range(next_count):
+                if abs(next_frequencies[search_index]) < a_tol:
+                    zero_term_index = search_index
+                    break
+            if zero_term_index < 0:
+                zero_term_index = next_count
+                next_frequencies[next_count] = 0.
+                next_count += 1
+            next_polynomials[zero_term_index, 0] += boundary_constant
+
+        current_count = next_count
+        for term_index in range(current_count):
+            current_frequencies[term_index] = next_frequencies[term_index]
+            current_degrees[term_index] = next_degrees[term_index]
+            for coefficient_index in range(current_degrees[term_index] + 1):
+                current_polynomials[term_index, coefficient_index] = (
+                    next_polynomials[term_index, coefficient_index]
+                )
+
+    polynomial_value = 0.
+    for term_index in range(current_count):
+        boundary_constant = 0.
+        for coefficient_index in range(
+            current_degrees[term_index], -1, -1
+        ):
+            boundary_constant = (
+                boundary_constant * dt
+                + current_polynomials[term_index, coefficient_index]
+            )
+        polynomial_value += (
+            exp(1j * current_frequencies[term_index] * dt)
+            * boundary_constant
+        )
+    return polynomial_value
+
+
 cpdef object cy_compute_Sn(
     double[:, :] omega_vectors,
     long[:, :] ket_bra_idx,
@@ -140,6 +271,64 @@ cpdef object cy_compute_Sn(
             )
 
     return Sn_arr
+
+
+cpdef object cy_compute_Sn_frequency_derivative_subsets(
+    double[:, :] omega_vectors,
+    long[:, :] ket_bra_idx,
+    double[:, :] diff_lambdas,
+    double complex[:] matrix_elements,
+    double dt,
+    int length,
+    double a_tol=1e-10,
+):
+    """Differentiate one unscaled Dyson tensor for every frequency subset."""
+    cdef Py_ssize_t n_omega = omega_vectors.shape[0]
+    cdef Py_ssize_t n_paths = diff_lambdas.shape[0]
+    cdef Py_ssize_t order = omega_vectors.shape[1]
+    cdef Py_ssize_t subset_count = 1 << order
+    cdef Py_ssize_t omega_index, path_index, frequency_index, subset
+    cdef Py_ssize_t derivative_count
+    cdef long row, col
+    cdef object output_arr = np.zeros(
+        (n_omega, subset_count, length, length), dtype=np.complex128
+    )
+    cdef double complex[:, :, :, :] output = output_arr
+    cdef object frequencies_arr = np.empty(order, dtype=float)
+    cdef double[:] frequencies = frequencies_arr
+    cdef object derivative_positions_arr = np.empty(order, dtype=np.int_)
+    cdef long[:] derivative_positions = derivative_positions_arr
+    cdef double complex derivative
+
+    for omega_index in range(n_omega):
+        for path_index in range(n_paths):
+            for frequency_index in range(order):
+                frequencies[frequency_index] = (
+                    omega_vectors[omega_index, frequency_index]
+                    + diff_lambdas[path_index, frequency_index]
+                )
+            row = ket_bra_idx[path_index, 0]
+            col = ket_bra_idx[path_index, 1]
+            output[omega_index, 0, row, col] += (
+                cy_compute_integrals(frequencies, dt, a_tol)
+                * matrix_elements[path_index]
+            )
+            for subset in range(1, subset_count):
+                derivative_count = 0
+                for frequency_index in range(order):
+                    if subset & (1 << frequency_index):
+                        derivative_positions[derivative_count] = frequency_index
+                        derivative_count += 1
+                derivative = _compute_moment_integral(
+                    frequencies, subset, dt, a_tol
+                )
+                for frequency_index in range(derivative_count):
+                    derivative *= 1j
+                output[omega_index, subset, row, col] += (
+                    derivative * matrix_elements[path_index]
+                )
+
+    return output_arr
 
 
 cpdef object cy_compute_Sn_frequency_derivatives(

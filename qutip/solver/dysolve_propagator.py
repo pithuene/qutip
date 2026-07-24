@@ -1,7 +1,11 @@
 from collections.abc import Callable
 
 from qutip import Qobj, qeye_like
-from .cy.dysolve import cy_compute_Sn, cy_compute_Sn_frequency_derivatives
+from .cy.dysolve import (
+    cy_compute_Sn,
+    cy_compute_Sn_frequency_derivatives,
+    cy_compute_Sn_frequency_derivative_subsets,
+)
 from numpy.typing import ArrayLike
 from scipy.special import erf
 import numpy as np
@@ -249,6 +253,7 @@ class DysolvePropagator:
         self._dt_key_decimals = options.get('dt_key_decimals', 15)
         self._dt_Sns = {}
         self._dt_Sn_frequency_derivatives = {}
+        self._dt_Sn_frequency_derivative_subsets = {}
         self._omega_vectors = {}
         self._omega_sums = {}
         self._branch_drive_indices = {}
@@ -527,6 +532,55 @@ class DysolvePropagator:
         cached_orders[order] = derivatives
         return derivatives
 
+    def _compute_Sn_frequency_derivative_subsets(
+        self, dt: float, order: int
+    ) -> ArrayLike:
+        """Return cached mixed derivatives for every frequency subset."""
+        if order < 1 or order > self.max_order:
+            raise ValueError(
+                f"order must be between 1 and max_order={self.max_order}"
+            )
+
+        dt_key = self._dt_cache_key(dt)
+        cached_orders = self._dt_Sn_frequency_derivative_subsets.setdefault(
+            dt_key, {}
+        )
+        if order in cached_orders:
+            return cached_orders[order]
+
+        exp_H_0 = self._compute_Sn(dt_key, 0)
+        length = len(self._eigenenergies)
+        eigenenergies = np.asarray(self._eigenenergies)
+        drive_indices, _, omega_vectors = self._get_branch_metadata(order)
+        derivative_subsets = np.zeros(
+            (len(omega_vectors), 1 << order, length, length),
+            dtype=np.complex128,
+        )
+        for drive_sequence in np.unique(drive_indices, axis=0):
+            mask = np.all(drive_indices == drive_sequence[None, :], axis=1)
+            paths, matrix_elements = self._get_matrix_element_paths(
+                tuple(drive_sequence)
+            )
+            if len(paths) == 0:
+                continue
+            path_energies = eigenenergies[paths]
+            diff_lambdas = -np.diff(path_energies)[:, ::-1]
+            ket_bra_idx = paths[:, [0, -1]]
+            derivative_group = cy_compute_Sn_frequency_derivative_subsets(
+                np.ascontiguousarray(omega_vectors[mask], dtype=float),
+                np.ascontiguousarray(ket_bra_idx, dtype=np.int_),
+                np.ascontiguousarray(diff_lambdas, dtype=float),
+                np.ascontiguousarray(matrix_elements, dtype=np.complex128),
+                dt_key,
+                length,
+                self.a_tol,
+            )
+            derivative_group *= (-1j / 2) ** order
+            derivative_subsets[mask] = exp_H_0 @ derivative_group
+
+        cached_orders[order] = derivative_subsets
+        return derivative_subsets
+
     def _compute_Sns(self, dt: float, max_order: int = None) -> dict:
         """Return cached Dyson tensors through ``max_order``."""
         if max_order is None:
@@ -557,6 +611,18 @@ class DysolvePropagator:
         if amplitudes.shape[1] == 0:
             raise ValueError("amplitudes must contain at least one subpixel")
         return amplitudes
+
+    def _as_drive_values(self, values: ArrayLike, *, name: str) -> ArrayLike:
+        """Return one complex value per configured drive."""
+        values = np.asarray(values, dtype=np.complex128)
+        if values.ndim == 0 and self._n_drives == 1:
+            values = values.reshape(1)
+        if values.shape != (self._n_drives,):
+            raise ValueError(
+                f"{name} must contain one value per drive; expected "
+                f"shape ({self._n_drives},), got {values.shape}"
+            )
+        return values
 
     def _format_drive_gradients(self, gradients):
         """Preserve the single-drive gradient return format."""
@@ -684,6 +750,79 @@ class DysolvePropagator:
         if gradient:
             return subpropagators, dsubprops_dx, dsubprops_dy
         return subpropagators
+
+    def _compute_linear_envelope_subpropagator(
+        self,
+        start_amplitudes: ArrayLike,
+        end_amplitudes: ArrayLike,
+        dt: float,
+        t0: float = 0.0,
+        *,
+        max_order: int = None,
+    ) -> ArrayLike:
+        """Propagate one subpixel with an exactly linear drive envelope."""
+        if dt == 0.0:
+            return np.eye(len(self._eigenenergies), dtype=np.complex128)
+        if max_order is None:
+            max_order = self.max_order
+        if max_order < 0 or max_order > self.max_order:
+            raise ValueError(
+                f"max_order must be between 0 and {self.max_order}"
+            )
+
+        start_amplitudes = self._as_drive_values(
+            start_amplitudes, name="start_amplitudes"
+        )
+        end_amplitudes = self._as_drive_values(
+            end_amplitudes, name="end_amplitudes"
+        )
+        dt = self._dt_cache_key(dt)
+        slopes = (end_amplitudes - start_amplitudes) / dt
+        length = len(self._eigenenergies)
+        subpropagator = self._compute_Sn(dt, 0).copy()
+
+        for order in range(1, max_order + 1):
+            drive_indices, signs, _ = self._get_branch_metadata(order)
+            n_branches = drive_indices.shape[0]
+            branch_starts = np.empty(
+                (n_branches, order), dtype=np.complex128
+            )
+            branch_slopes = np.empty_like(branch_starts)
+            for position in range(order):
+                for drive_index in range(self._n_drives):
+                    drive_mask = drive_indices[:, position] == drive_index
+                    positive = drive_mask & (signs[:, position] > 0)
+                    negative = drive_mask & (signs[:, position] < 0)
+                    branch_starts[positive, position] = np.conjugate(
+                        start_amplitudes[drive_index]
+                    )
+                    branch_slopes[positive, position] = np.conjugate(
+                        slopes[drive_index]
+                    )
+                    branch_starts[negative, position] = start_amplitudes[
+                        drive_index
+                    ]
+                    branch_slopes[negative, position] = slopes[drive_index]
+
+            phases = np.exp(1j * self._get_omega_sums(order) * float(t0))
+            derivative_subsets = self._compute_Sn_frequency_derivative_subsets(
+                dt, order
+            )
+            for subset in range(1 << order):
+                coefficients = np.ones(n_branches, dtype=np.complex128)
+                for position in range(order):
+                    if subset & (1 << position):
+                        coefficients *= -1j * branch_slopes[:, position]
+                    else:
+                        coefficients *= branch_starts[:, position]
+                subpropagator += np.tensordot(
+                    phases * coefficients,
+                    derivative_subsets[:, subset],
+                    axes=(0, 0),
+                )
+
+        assert subpropagator.shape == (length, length)
+        return subpropagator
 
     def prepare_envelope(self, amplitudes: ArrayLike, dt: float) -> PreparedDysolveEnvelope:
         """Prepare a reusable t0-independent envelope contraction."""
