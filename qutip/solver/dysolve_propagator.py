@@ -1,7 +1,7 @@
 from collections.abc import Callable
 
 from qutip import Qobj, qeye_like
-from .cy.dysolve import cy_compute_Sn
+from .cy.dysolve import cy_compute_Sn, cy_compute_Sn_frequency_derivatives
 from numpy.typing import ArrayLike
 from scipy.special import erf
 import numpy as np
@@ -248,6 +248,7 @@ class DysolvePropagator:
         # Memoization
         self._dt_key_decimals = options.get('dt_key_decimals', 15)
         self._dt_Sns = {}
+        self._dt_Sn_frequency_derivatives = {}
         self._omega_vectors = {}
         self._omega_sums = {}
         self._branch_drive_indices = {}
@@ -479,6 +480,52 @@ class DysolvePropagator:
 
         cached_orders[order] = Sn
         return Sn
+
+    def _compute_Sn_frequency_derivatives(
+        self, dt: float, order: int
+    ) -> ArrayLike:
+        """Return cached derivatives with respect to branch frequencies."""
+        if order < 1 or order > self.max_order:
+            raise ValueError(
+                f"order must be between 1 and max_order={self.max_order}"
+            )
+
+        dt_key = self._dt_cache_key(dt)
+        cached_orders = self._dt_Sn_frequency_derivatives.setdefault(dt_key, {})
+        if order in cached_orders:
+            return cached_orders[order]
+
+        exp_H_0 = self._compute_Sn(dt_key, 0)
+        length = len(self._eigenenergies)
+        eigenenergies = np.asarray(self._eigenenergies)
+        drive_indices, _, omega_vectors = self._get_branch_metadata(order)
+        derivatives = np.zeros(
+            (len(omega_vectors), order, length, length), dtype=np.complex128
+        )
+        for drive_sequence in np.unique(drive_indices, axis=0):
+            mask = np.all(drive_indices == drive_sequence[None, :], axis=1)
+            paths, matrix_elements = self._get_matrix_element_paths(
+                tuple(drive_sequence)
+            )
+            if len(paths) == 0:
+                continue
+            path_energies = eigenenergies[paths]
+            diff_lambdas = -np.diff(path_energies)[:, ::-1]
+            ket_bra_idx = paths[:, [0, -1]]
+            derivative_group = cy_compute_Sn_frequency_derivatives(
+                np.ascontiguousarray(omega_vectors[mask], dtype=float),
+                np.ascontiguousarray(ket_bra_idx, dtype=np.int_),
+                np.ascontiguousarray(diff_lambdas, dtype=float),
+                np.ascontiguousarray(matrix_elements, dtype=np.complex128),
+                dt_key,
+                length,
+                self.a_tol,
+            )
+            derivative_group *= (-1j / 2) ** order
+            derivatives[mask] = exp_H_0 @ derivative_group
+
+        cached_orders[order] = derivatives
+        return derivatives
 
     def _compute_Sns(self, dt: float, max_order: int = None) -> dict:
         """Return cached Dyson tensors through ``max_order``."""

@@ -4,11 +4,17 @@ from qutip.solver.dysolve_propagator import (
     gaussian_filter_matrix,
 )
 from qutip.solver import propagator
-from qutip.solver.cy.dysolve import cy_compute_integrals
+from qutip.solver.cy.dysolve import (
+    cy_compute_integrals,
+    cy_compute_integral_frequency_derivatives,
+    cy_compute_Sn,
+    cy_compute_Sn_frequency_derivatives,
+)
 from qutip import (
     CoreOptions, sigmax, sigmay, sigmaz, qeye,
     qeye_like, tensor, enr_destroy,
 )
+from scipy.linalg import expm_frechet
 from scipy.special import factorial
 import numpy as np
 import pytest
@@ -374,6 +380,127 @@ def test_multi_drive_filtered_gradient_matches_finite_difference():
         rtol=1e-8,
         atol=1e-8,
     )
+
+
+@pytest.mark.parametrize(
+    "frequencies",
+    [
+        np.array([0.7]),
+        np.array([0.7, 1.2]),
+        np.array([0.7, 1.2, -0.3]),
+    ],
+)
+def test_integral_frequency_derivatives_match_finite_difference(frequencies):
+    dt = 0.4
+    actual = cy_compute_integral_frequency_derivatives(frequencies, dt, 1e-12)
+    expected = []
+    epsilon = 1e-6
+    for frequency_index in range(len(frequencies)):
+        plus = frequencies.copy()
+        minus = frequencies.copy()
+        plus[frequency_index] += epsilon
+        minus[frequency_index] -= epsilon
+        expected.append(
+            (
+                cy_compute_integrals(plus, dt, 1e-12)
+                - cy_compute_integrals(minus, dt, 1e-12)
+            )
+            / (2 * epsilon)
+        )
+
+    np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=1e-9)
+
+
+@pytest.mark.parametrize(
+    "frequencies",
+    [
+        np.array([0.0, 1.2, -0.3]),
+        np.array([0.7, 0.0, -0.3]),
+        np.array([0.0, 0.0]),
+    ],
+)
+def test_integral_frequency_derivatives_handle_degenerate_frequencies(frequencies):
+    dt = 0.4
+    actual = cy_compute_integral_frequency_derivatives(frequencies, dt, 1e-12)
+    cumulative_frequencies = np.cumsum(frequencies[::-1])[::-1]
+    generator = np.diag(np.append(1j * cumulative_frequencies, 0.0))
+    generator += np.diag(np.ones(len(frequencies)), 1)
+    expected = []
+    for frequency_index in range(len(frequencies)):
+        generator_derivative = np.zeros_like(generator)
+        diagonal_indices = np.arange(frequency_index + 1)
+        generator_derivative[diagonal_indices, diagonal_indices] = 1j
+        expected.append(
+            expm_frechet(
+                dt * generator,
+                dt * generator_derivative,
+                compute_expm=False,
+            )[0, -1]
+        )
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-11, atol=1e-12)
+
+
+def test_Sn_frequency_derivatives_match_finite_difference():
+    omega_vectors = np.array([[0.7, 1.2], [-0.7, 1.2]])
+    ket_bra_indices = np.array([[0, 1], [1, 0]], dtype=int)
+    diff_lambdas = np.array([[0.11, -0.23], [-0.19, 0.31]])
+    matrix_elements = np.array([0.4 + 0.2j, -0.1 + 0.3j])
+    dt = 0.4
+    actual = cy_compute_Sn_frequency_derivatives(
+        omega_vectors,
+        ket_bra_indices,
+        diff_lambdas,
+        matrix_elements,
+        dt,
+        2,
+        1e-12,
+    )
+    epsilon = 1e-6
+    for frequency_index in range(omega_vectors.shape[1]):
+        plus = omega_vectors.copy()
+        minus = omega_vectors.copy()
+        plus[:, frequency_index] += epsilon
+        minus[:, frequency_index] -= epsilon
+        expected = (
+            cy_compute_Sn(
+                plus,
+                ket_bra_indices,
+                diff_lambdas,
+                matrix_elements,
+                dt,
+                2,
+                1e-12,
+            )
+            - cy_compute_Sn(
+                minus,
+                ket_bra_indices,
+                diff_lambdas,
+                matrix_elements,
+                dt,
+                2,
+                1e-12,
+            )
+        ) / (2 * epsilon)
+        np.testing.assert_allclose(
+            actual[:, frequency_index], expected, rtol=2e-6, atol=1e-9
+        )
+
+
+def test_frequency_derivative_tensors_are_cached_lazily():
+    solver = DysolvePropagator(
+        0.31 * sigmaz(),
+        0.19 * sigmax(),
+        1.3,
+        options=_adaptive_options(0.02, max_order=3),
+    )
+
+    derivatives = solver._compute_Sn_frequency_derivatives(0.02, 2)
+
+    assert derivatives.shape == (4, 2, 2, 2)
+    assert solver._compute_Sn_frequency_derivatives(0.02, 2) is derivatives
+    assert set(solver._dt_Sns[0.02]) == {0}
+    assert set(solver._dt_Sn_frequency_derivatives[0.02]) == {2}
 
 
 @pytest.mark.parametrize("eff_omega", [-10.0, -1.0, -0.1, 0.1, 1.0, 10.0])

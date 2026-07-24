@@ -59,6 +59,48 @@ cpdef complex cy_compute_integrals(double[:] ws, double dt, double a_tol=1e-10):
             )
 
 
+cdef void _compute_integral_frequency_derivatives(
+    double[:] frequencies,
+    double dt,
+    double a_tol,
+    double complex[:] derivatives,
+):
+    """Differentiate one nested integral with respect to each frequency."""
+    cdef Py_ssize_t order = frequencies.shape[0]
+    cdef Py_ssize_t insertion_index, source_index
+    cdef object augmented_arr = np.empty(order + 1, dtype=float)
+    cdef double[:] augmented = augmented_arr
+    cdef double complex cumulative_integral = 0.
+
+    # Inserting a zero-frequency integration at position r contributes the
+    # interval between time-ordering variables r - 1 and r. Their cumulative
+    # sum is the time multiplying each differentiated exponential.
+    for insertion_index in range(order):
+        for source_index in range(insertion_index):
+            augmented[source_index] = frequencies[source_index]
+        augmented[insertion_index] = 0.
+        for source_index in range(insertion_index, order):
+            augmented[source_index + 1] = frequencies[source_index]
+        cumulative_integral += cy_compute_integrals(augmented, dt, a_tol)
+        derivatives[insertion_index] = 1j * cumulative_integral
+
+
+cpdef object cy_compute_integral_frequency_derivatives(
+    double[:] frequencies,
+    double dt,
+    double a_tol=1e-10,
+):
+    """Differentiate a nested Dyson integral by its frequency entries."""
+    cdef object derivatives_arr = np.empty(
+        frequencies.shape[0], dtype=np.complex128
+    )
+    cdef double complex[:] derivatives = derivatives_arr
+    _compute_integral_frequency_derivatives(
+        frequencies, dt, a_tol, derivatives
+    )
+    return derivatives_arr
+
+
 cpdef object cy_compute_Sn(
     double[:, :] omega_vectors,
     long[:, :] ket_bra_idx,
@@ -98,6 +140,50 @@ cpdef object cy_compute_Sn(
             )
 
     return Sn_arr
+
+
+cpdef object cy_compute_Sn_frequency_derivatives(
+    double[:, :] omega_vectors,
+    long[:, :] ket_bra_idx,
+    double[:, :] diff_lambdas,
+    double complex[:] matrix_elements,
+    double dt,
+    int length,
+    double a_tol=1e-10,
+):
+    """Differentiate one unscaled Dyson tensor by each branch frequency."""
+    cdef Py_ssize_t n_omega = omega_vectors.shape[0]
+    cdef Py_ssize_t n_paths = diff_lambdas.shape[0]
+    cdef Py_ssize_t order = omega_vectors.shape[1]
+    cdef Py_ssize_t omega_index, path_index, frequency_index
+    cdef long row, col
+    cdef object output_arr = np.zeros(
+        (n_omega, order, length, length), dtype=np.complex128
+    )
+    cdef double complex[:, :, :, :] output = output_arr
+    cdef object frequencies_arr = np.empty(order, dtype=float)
+    cdef double[:] frequencies = frequencies_arr
+    cdef object derivatives_arr = np.empty(order, dtype=np.complex128)
+    cdef double complex[:] derivatives = derivatives_arr
+
+    for omega_index in range(n_omega):
+        for path_index in range(n_paths):
+            for frequency_index in range(order):
+                frequencies[frequency_index] = (
+                    omega_vectors[omega_index, frequency_index]
+                    + diff_lambdas[path_index, frequency_index]
+                )
+            _compute_integral_frequency_derivatives(
+                frequencies, dt, a_tol, derivatives
+            )
+            row = ket_bra_idx[path_index, 0]
+            col = ket_bra_idx[path_index, 1]
+            for frequency_index in range(order):
+                output[omega_index, frequency_index, row, col] += (
+                    derivatives[frequency_index] * matrix_elements[path_index]
+                )
+
+    return output_arr
 
 
 cdef complex cy_compute_tn_integrals(double[:] ws, int n, double dt, double a_tol=1e-10):
