@@ -1,17 +1,25 @@
+import numpy as np
+import pytest
+from scipy.special import factorial
+
+from qutip import (
+    CoreOptions,
+    Qobj,
+    enr_destroy,
+    qeye,
+    qeye_like,
+    sigmax,
+    sigmay,
+    sigmaz,
+    tensor,
+)
+from qutip.solver import propagator
+from qutip.solver.cy.dysolve import cy_compute_integrals
 from qutip.solver.dysolve_propagator import (
     DysolvePropagator,
     dysolve_propagator,
     gaussian_filter_matrix,
 )
-from qutip.solver import propagator
-from qutip.solver.cy.dysolve import cy_compute_integrals
-from qutip import (
-    CoreOptions, sigmax, sigmay, sigmaz, qeye,
-    qeye_like, tensor, enr_destroy,
-)
-from scipy.special import factorial
-import numpy as np
-import pytest
 
 
 def _enr_xx():
@@ -68,6 +76,112 @@ def test_prepared_envelope_matches_direct_subpropagator_contraction():
             atol=1e-12,
         )
 
+
+def test_prepared_envelope_nbytes_matches_owned_arrays():
+    amplitudes = np.array([0.7 + 0.1j, -0.2 + 0.3j, 0.4 - 0.2j])
+    solver = DysolvePropagator(
+        0.31 * sigmaz(),
+        0.19 * sigmax(),
+        1.3,
+        options={"max_order": 3},
+    )
+
+    prepared = solver.prepare_envelope(amplitudes, 0.02)
+    owned_array_nbytes = prepared._amplitudes.nbytes + sum(
+        omega_sums.nbytes + contractions.nbytes
+        for omega_sums, contractions in prepared._terms
+    )
+
+    assert prepared.nbytes == owned_array_nbytes
+    assert prepared.nbytes == solver.estimate_prepared_envelope_nbytes(len(amplitudes))
+
+
+def test_timestep_tensor_cache_evicts_by_lru_and_recomputes():
+    solver = DysolvePropagator(
+        0.31 * sigmaz(),
+        0.19 * sigmax(),
+        1.3,
+        options={"max_order": 1, "dt_cache_size": 2},
+    )
+    first = solver._compute_Sns(0.01)
+    second = solver._compute_Sns(0.02)
+
+    assert solver._compute_Sns(0.01) is first
+    solver._compute_Sns(0.03)
+
+    assert len(solver._dt_Sns) <= 2
+    assert tuple(solver._dt_Sns) == (0.01, 0.03)
+    recomputed_second = solver._compute_Sns(0.02)
+
+    assert recomputed_second is not second
+    for order in second:
+        np.testing.assert_allclose(recomputed_second[order], second[order])
+    assert len(solver._dt_Sns) <= 2
+
+
+def test_zero_timestep_tensor_cache_size_bypasses_storage():
+    solver = DysolvePropagator(
+        0.31 * sigmaz(),
+        0.19 * sigmax(),
+        1.3,
+        options={"max_order": 0, "dt_cache_size": 0},
+    )
+
+    first = solver._compute_Sns(0.01)
+    second = solver._compute_Sns(0.01)
+
+    assert first is not second
+    np.testing.assert_allclose(first[0], second[0])
+    assert not solver._dt_Sns
+
+
+@pytest.mark.parametrize("invalid_limit", [-1, 1.5, True])
+def test_timestep_tensor_cache_size_must_be_non_negative_integer(invalid_limit):
+    with pytest.raises(ValueError, match="dt_cache_size"):
+        DysolvePropagator(
+            0.31 * sigmaz(),
+            0.19 * sigmax(),
+            1.3,
+            options={"dt_cache_size": invalid_limit},
+        )
+
+
+def test_timestep_tensor_cache_size_defaults_to_64():
+    solver = DysolvePropagator(0.31 * sigmaz(), 0.19 * sigmax(), 1.3)
+
+    assert solver.dt_cache_size == 64
+
+
+def test_batched_envelope_matches_full_prepared_result_with_absolute_t0():
+    dt = 0.02
+    t0 = 0.17
+    amplitudes = np.array([
+        0.7 + 0.1j,
+        -0.2 + 0.3j,
+        0.4 - 0.2j,
+        -0.1 - 0.6j,
+        0.2 + 0.5j,
+    ])
+    solver = DysolvePropagator(
+        0.31 * sigmaz(),
+        0.19 * sigmax(),
+        1.3,
+        options={"max_order": 3, "batch_size": 2},
+    )
+    prepared = solver.prepare_envelope(amplitudes, dt)
+    full_total = np.eye(2, dtype=np.complex128)
+    for subpropagator in prepared.subpropagators(t0):
+        full_total = subpropagator @ full_total
+    full_result = Qobj(full_total, solver._H_0._dims, copy=False).transform(
+        solver._basis, True
+    )
+
+    batched = solver.envelope_propagator(amplitudes, dt, t0=t0)
+
+    np.testing.assert_allclose(_qobj_data(batched), _qobj_data(full_result), rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(
+        _qobj_data(prepared.propagator(t0)), _qobj_data(full_result), rtol=1e-12, atol=1e-12
+    )
 
 
 def test_envelope_propagator_real_gradient_matches_finite_difference():
@@ -141,6 +255,7 @@ def test_envelope_propagator_quadrature_gradients_match_finite_difference():
 
 def test_envelope_parameter_gradients_match_quadrature_contraction():
     dt = 0.02
+    t0 = 0.11
     amplitudes = np.array([0.7 + 0.1j, -0.2 + 0.3j, 0.4 - 0.2j])
     derivatives = np.array(
         [
@@ -153,17 +268,19 @@ def test_envelope_parameter_gradients_match_quadrature_contraction():
         0.31 * sigmaz(),
         0.19 * sigmax(),
         1.3,
-        options={"max_order": 3, "max_dt": dt, "a_tol": 1e-12},
+        options={"max_order": 3, "max_dt": dt, "a_tol": 1e-12, "batch_size": 2},
     )
 
     propagator, parameter_gradients = solver.envelope_parameter_gradients(
         amplitudes,
         derivatives,
         dt,
+        t0=t0,
     )
     reference_propagator, gradients_x, gradients_y = solver.envelope_propagator(
         amplitudes,
         dt,
+        t0=t0,
         gradient="quadratures",
     )
     expected = []

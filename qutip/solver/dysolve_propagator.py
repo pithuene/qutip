@@ -1,11 +1,14 @@
-from qutip import Qobj, qeye_like
-from .cy.dysolve import cy_compute_Sn
+import itertools
+from collections import OrderedDict
+from numbers import Number
+
+import numpy as np
 from numpy.typing import ArrayLike
 from scipy.special import erf
-import numpy as np
-from numbers import Number
-import itertools
 
+from qutip import Qobj, qeye_like
+
+from .cy.dysolve import cy_compute_Sn
 
 __all__ = ['DysolvePropagator', 'PreparedDysolveEnvelope', 'dysolve_propagator', 'gaussian_filter_matrix']
 
@@ -64,12 +67,29 @@ class PreparedDysolveEnvelope:
 
     def __init__(self, solver, amplitudes: ArrayLike, dt: float):
         self._solver = solver
-        self.dt = float(dt)
-        self._amplitudes = solver._as_drive_amplitudes(amplitudes)
+        self.dt = solver.canonical_time_step(dt)
+        self._amplitudes = np.array(
+            solver._as_drive_amplitudes(amplitudes),
+            dtype=np.complex128,
+            order='C',
+            copy=True,
+        )
         self.n_subpixels = int(self._amplitudes.shape[1])
         self._length = len(solver._eigenenergies)
         self._S0 = solver._compute_Sns(self.dt)[0]
         self._terms = self._prepare_terms()
+
+    @property
+    def nbytes(self) -> int:
+        """Return bytes in arrays owned only by this prepared envelope.
+
+        Shared solver tensors such as ``_S0`` and cached Dyson tensors are
+        excluded.
+        """
+        return self._amplitudes.nbytes + sum(
+            omega_sums.nbytes + contractions.nbytes
+            for omega_sums, contractions in self._terms
+        )
 
     def _prepare_terms(self):
         solver = self._solver
@@ -95,21 +115,29 @@ class PreparedDysolveEnvelope:
             terms.append((unique_omega_sums, contractions))
         return tuple(terms)
 
-    def subpropagators(self, t0: float = 0.0) -> ArrayLike:
-        """Return subpixel propagators for a pulse starting at ``t0``."""
+    def _subpropagators_slice(self, start: int, stop: int, t0: float) -> ArrayLike:
+        """Materialize one chronological slice of prepared subpropagators."""
         subpropagators = np.broadcast_to(
-            self._S0, (self.n_subpixels, self._length, self._length)
+            self._S0, (stop - start, self._length, self._length)
         ).astype(np.complex128, copy=True)
         for omega_sums, contractions in self._terms:
             phases = np.exp(1j * omega_sums * float(t0))
-            subpropagators += np.tensordot(phases, contractions, axes=(0, 0))
+            subpropagators += np.tensordot(
+                phases, contractions[:, start:stop], axes=(0, 0)
+            )
         return subpropagators
+
+    def subpropagators(self, t0: float = 0.0) -> ArrayLike:
+        """Return subpixel propagators for a pulse starting at ``t0``."""
+        return self._subpropagators_slice(0, self.n_subpixels, t0)
 
     def propagator(self, t0: float = 0.0) -> Qobj:
         """Return the full envelope propagator for a pulse starting at ``t0``."""
         total = np.eye(self._length, dtype=np.complex128)
-        for subpropagator in self.subpropagators(t0):
-            total = subpropagator @ total
+        for start in range(0, self.n_subpixels, self._solver.batch_size):
+            stop = min(start + self._solver.batch_size, self.n_subpixels)
+            for subpropagator in self._subpropagators_slice(start, stop, t0):
+                total = subpropagator @ total
         return Qobj(total, self._solver._H_0._dims, copy=False).transform(
             self._solver._basis, True
         )
@@ -155,6 +183,11 @@ class DysolvePropagator:
             Number of same-dt substeps to contract at once when materializing
             subpropagators (default is 10). Larger values reduce Python
             overhead for small Hilbert spaces, but use more memory.
+
+        - "dt_cache_size"
+
+            Maximum number of canonical time-step tensors retained by each
+            solver (default is 64). Zero disables this cache.
 
     Notes
     -----
@@ -224,17 +257,21 @@ class DysolvePropagator:
             self.a_tol = 1e-10
             self.max_dt = 0.1
             self.batch_size = 10
+            self.dt_cache_size = 64
         else:
             self.max_order = options.get('max_order', 4)
             self.max_dt = options.get('max_dt', 0.1)
             self.a_tol = options.get('a_tol', 1e-10)
             self.batch_size = options.get('batch_size', 10)
+            self.dt_cache_size = options.get('dt_cache_size', 64)
+        if type(self.dt_cache_size) is not int or self.dt_cache_size < 0:
+            raise ValueError("dt_cache_size must be a non-negative integer")
 
         # Memoization
         self._dt_key_decimals = (
             options.get('dt_key_decimals', 15) if options is not None else 15
         )
-        self._dt_Sns = {}
+        self._dt_Sns = OrderedDict()
         self._omega_vectors = {}
         self._omega_sums = {}
         self._branch_drive_indices = {}
@@ -469,14 +506,12 @@ class DysolvePropagator:
         self._matrix_element_paths[drive_indices] = (paths, path_values)
         return paths, path_values
 
-    def _dt_cache_key(self, dt: float) -> float:
-        """
-        Normalize time-step cache keys.
+    def canonical_time_step(self, dt: float) -> float:
+        """Return the time step used for preparation and solver caches.
 
         Pulse programs often produce mathematically identical durations with
-        tiny floating-point differences. Exact float keys defeat the expensive
-        Dyson-operator cache, so cache at femtosecond-like precision by
-        default while still using the rounded value consistently.
+        tiny floating-point differences. The configured precision normalizes
+        those differences before any prepared or shared tensors use the step.
         """
         return round(float(dt), self._dt_key_decimals)
 
@@ -496,9 +531,11 @@ class DysolvePropagator:
         Sns : dict
             Sns for each branch vector, keyed by Dyson order.
         """
-        dt_key = self._dt_cache_key(dt)
+        dt_key = self.canonical_time_step(dt)
         if dt_key in self._dt_Sns:
-            return self._dt_Sns[dt_key]
+            Sns = self._dt_Sns[dt_key]
+            self._dt_Sns.move_to_end(dt_key)
+            return Sns
 
         dt = dt_key
         Sns = {}
@@ -539,7 +576,10 @@ class DysolvePropagator:
 
             Sns[n] = Sn
 
-        self._dt_Sns[dt_key] = Sns
+        if self.dt_cache_size > 0:
+            self._dt_Sns[dt_key] = Sns
+            while len(self._dt_Sns) > self.dt_cache_size:
+                self._dt_Sns.popitem(last=False)
         return Sns
 
     def _as_drive_amplitudes(self, amplitudes: ArrayLike) -> ArrayLike:
@@ -684,6 +724,25 @@ class DysolvePropagator:
             return subpropagators, dsubprops_dx, dsubprops_dy
         return subpropagators
 
+    def estimate_prepared_envelope_nbytes(self, n_subpixels: int) -> int:
+        """Estimate arrays owned by a prepared complex128 envelope.
+
+        Shared solver tensors are excluded, matching
+        :attr:`PreparedDysolveEnvelope.nbytes`.
+        """
+        if n_subpixels <= 0:
+            raise ValueError("n_subpixels must be positive")
+        length = len(self._eigenenergies)
+        amplitude_bytes = self._n_drives * n_subpixels * np.dtype(np.complex128).itemsize
+        term_bytes = 0
+        for order in range(1, self.max_order + 1):
+            unique_omega_count = len(np.unique(self._get_omega_sums(order)))
+            term_bytes += unique_omega_count * (
+                np.dtype(float).itemsize
+                + n_subpixels * length * length * np.dtype(np.complex128).itemsize
+            )
+        return amplitude_bytes + term_bytes
+
     def prepare_envelope(self, amplitudes: ArrayLike, dt: float) -> PreparedDysolveEnvelope:
         """Prepare a reusable t0-independent envelope contraction."""
         return PreparedDysolveEnvelope(self, amplitudes, dt)
@@ -718,38 +777,39 @@ class DysolvePropagator:
                 "amplitude_derivatives trailing dimensions must match amplitudes"
             )
 
-        subprops, dsubprops_dx, dsubprops_dy = self._compute_envelope_subprops(
-            amplitudes, dt, t0, gradient=True
-        )
         length = len(self._eigenenergies)
-        prefixes = [np.eye(length, dtype=np.complex128)]
-        for subprop in subprops:
-            prefixes.append(subprop @ prefixes[-1])
-        total = prefixes[-1]
-        U = Qobj(total, self._H_0._dims, copy=False).transform(
-            self._basis, True
-        )
-
+        total = np.eye(length, dtype=np.complex128)
         parameter_gradients = np.zeros(
             (n_parameters, length, length), dtype=np.complex128
         )
-        suffix = np.eye(length, dtype=np.complex128)
-        for index in range(len(subprops) - 1, -1, -1):
-            for drive_index in range(self._n_drives):
-                gradient_x = (
-                    suffix @ dsubprops_dx[drive_index, index] @ prefixes[index]
+        for start in range(0, amplitudes.shape[1], self.batch_size):
+            stop = min(start + self.batch_size, amplitudes.shape[1])
+            subprops, dsubprops_dx, dsubprops_dy = self._compute_envelope_subprops(
+                amplitudes[:, start:stop],
+                dt,
+                t0 + start * dt,
+                gradient=True,
+            )
+            batch_derivatives = derivatives[:, :, start:stop]
+            for index, subpropagator in enumerate(subprops):
+                subpropagator_derivatives = np.einsum(
+                    'pd,dij->pij',
+                    batch_derivatives[:, :, index].real,
+                    dsubprops_dx[:, index],
+                ) + np.einsum(
+                    'pd,dij->pij',
+                    batch_derivatives[:, :, index].imag,
+                    dsubprops_dy[:, index],
                 )
-                gradient_y = (
-                    suffix @ dsubprops_dy[drive_index, index] @ prefixes[index]
+                parameter_gradients = (
+                    subpropagator @ parameter_gradients
+                    + subpropagator_derivatives @ total
                 )
-                real_derivatives = derivatives[:, drive_index, index].real
-                imaginary_derivatives = derivatives[:, drive_index, index].imag
-                parameter_gradients += (
-                    real_derivatives[:, None, None] * gradient_x
-                    + imaginary_derivatives[:, None, None] * gradient_y
-                )
-            suffix = suffix @ subprops[index]
+                total = subpropagator @ total
 
+        U = Qobj(total, self._H_0._dims, copy=False).transform(
+            self._basis, True
+        )
         dU_dp = tuple(
             Qobj(gradient, self._H_0._dims, copy=False).transform(
                 self._basis, True
@@ -786,7 +846,19 @@ class DysolvePropagator:
             )
         want_gradient = bool(gradient)
         if not want_gradient:
-            return self.prepare_envelope(amplitudes, dt).propagator(t0)
+            amplitudes = self._as_drive_amplitudes(amplitudes)
+            length = len(self._eigenenergies)
+            total = np.eye(length, dtype=np.complex128)
+            for start in range(0, amplitudes.shape[1], self.batch_size):
+                stop = min(start + self.batch_size, amplitudes.shape[1])
+                subpropagators = self._compute_envelope_subprops(
+                    amplitudes[:, start:stop], dt, t0 + start * dt
+                )
+                for subpropagator in subpropagators:
+                    total = subpropagator @ total
+            return Qobj(total, self._H_0._dims, copy=False).transform(
+                self._basis, True
+            )
 
         step_data = self._compute_envelope_subprops(
             amplitudes, dt, t0, gradient=True
