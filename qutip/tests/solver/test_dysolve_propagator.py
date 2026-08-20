@@ -166,7 +166,11 @@ def test_batched_envelope_matches_full_prepared_result_with_absolute_t0():
         0.31 * sigmaz(),
         0.19 * sigmax(),
         1.3,
-        options={"max_order": 3, "batch_size": 2},
+        options={
+            "max_order": 3,
+            "batch_size": 2,
+            "fixed_order_workspace_bytes": 2200,
+        },
     )
     prepared = solver.prepare_envelope(amplitudes, dt)
     full_total = np.eye(2, dtype=np.complex128)
@@ -184,76 +188,128 @@ def test_batched_envelope_matches_full_prepared_result_with_absolute_t0():
     )
 
 
-def test_envelope_propagator_real_gradient_matches_finite_difference():
-    dt = 0.02
-    amplitudes = np.array([0.7, -0.2, 0.4])
-    solver = DysolvePropagator(
+def test_chronological_product_matches_sequential_reduction_for_odd_batch():
+    random = np.random.default_rng(98123)
+    matrices = random.normal(size=(7, 3, 3)) + 1j * random.normal(size=(7, 3, 3))
+    sequential = np.eye(3, dtype=np.complex128)
+    for matrix in matrices:
+        sequential = matrix @ sequential
+
+    pairwise, derivatives = DysolvePropagator._chronological_product(matrices)
+
+    np.testing.assert_allclose(pairwise, sequential, rtol=1e-13, atol=1e-13)
+    assert derivatives.shape == (0, 3, 3)
+
+
+def test_chronological_product_reduces_parameter_derivatives():
+    random = np.random.default_rng(7124)
+    matrices = np.eye(3)[None, :, :] + 0.01 * (
+        random.normal(size=(7, 3, 3)) + 1j * random.normal(size=(7, 3, 3))
+    )
+    derivatives = 0.01 * (
+        random.normal(size=(2, 7, 3, 3)) + 1j * random.normal(size=(2, 7, 3, 3))
+    )
+    sequential = np.eye(3, dtype=np.complex128)
+    sequential_derivatives = np.zeros((2, 3, 3), dtype=np.complex128)
+    for matrix, matrix_derivatives in zip(matrices, derivatives.transpose(1, 0, 2, 3), strict=True):
+        sequential_derivatives = matrix @ sequential_derivatives + matrix_derivatives @ sequential
+        sequential = matrix @ sequential
+
+    pairwise, pairwise_derivatives = DysolvePropagator._chronological_product(matrices, derivatives)
+
+    np.testing.assert_allclose(pairwise, sequential, rtol=1e-13, atol=1e-13)
+    np.testing.assert_allclose(pairwise_derivatives, sequential_derivatives, rtol=1e-13, atol=1e-13)
+
+
+@pytest.mark.parametrize(
+    "option_name, invalid_value",
+    [
+        ("fixed_order_workspace_bytes", 0),
+        ("fixed_order_workspace_bytes", 1.5),
+        ("fixed_order_workspace_bytes", True),
+        ("fixed_order_batch_size", 0),
+        ("fixed_order_batch_size", 1.5),
+        ("fixed_order_batch_size", True),
+    ],
+)
+def test_fixed_order_workspace_options_require_positive_integers(option_name, invalid_value):
+    with pytest.raises(ValueError, match=option_name):
+        DysolvePropagator(
+            0.31 * sigmaz(),
+            0.19 * sigmax(),
+            1.3,
+            options={option_name: invalid_value},
+        )
+
+
+def test_fixed_order_batch_respects_performance_tile_and_workspace():
+    tile_limited_solver = DysolvePropagator(
         0.31 * sigmaz(),
         0.19 * sigmax(),
         1.3,
-        options={"max_order": 3, "max_dt": dt, "a_tol": 1e-12},
+        options={
+            "max_order": 3,
+            "fixed_order_workspace_bytes": 1024**2,
+            "fixed_order_batch_size": 7,
+        },
     )
+    assert tile_limited_solver._fixed_order_batch_size() == 7
+    assert tile_limited_solver._fixed_order_batch_size(3) == 7
 
-    _, gradients = solver.envelope_propagator(amplitudes, dt, gradient="real")
-    eps = 1e-6
-    for index, gradient in enumerate(gradients):
-        plus = amplitudes.copy()
-        minus = amplitudes.copy()
-        plus[index] += eps
-        minus[index] -= eps
-        finite_difference = (
-            _qobj_data(solver.envelope_propagator(plus, dt))
-            - _qobj_data(solver.envelope_propagator(minus, dt))
-        ) / (2 * eps)
-        np.testing.assert_allclose(
-            _qobj_data(gradient), finite_difference, rtol=1e-8, atol=1e-8
-        )
-
-
-def test_envelope_propagator_quadrature_gradients_match_finite_difference():
-    dt = 0.02
-    amplitudes = np.array([0.7 + 0.1j, -0.2 + 0.3j, 0.4 - 0.2j])
-    solver = DysolvePropagator(
+    workspace_limited_solver = DysolvePropagator(
         0.31 * sigmaz(),
         0.19 * sigmax(),
         1.3,
-        options={"max_order": 3, "max_dt": dt, "a_tol": 1e-12},
+        options={"max_order": 3, "fixed_order_workspace_bytes": 10_000},
     )
+    assert workspace_limited_solver._fixed_order_batch_size() > 1
+    assert workspace_limited_solver._fixed_order_batch_size(3) < workspace_limited_solver._fixed_order_batch_size()
 
-    _, gradients_x, gradients_y = solver.envelope_propagator(
-        amplitudes, dt, gradient="quadratures"
+    limited_solver = DysolvePropagator(
+        0.31 * sigmaz(),
+        0.19 * sigmax(),
+        1.3,
+        options={"max_order": 3, "fixed_order_workspace_bytes": 1},
     )
-    eps = 1e-6
-    for index, (gradient_x, gradient_y) in enumerate(
-        zip(gradients_x, gradients_y, strict=True)
-    ):
-        plus = amplitudes.copy()
-        minus = amplitudes.copy()
-        plus[index] += eps
-        minus[index] -= eps
-        finite_difference_x = (
-            _qobj_data(solver.envelope_propagator(plus, dt))
-            - _qobj_data(solver.envelope_propagator(minus, dt))
-        ) / (2 * eps)
-        np.testing.assert_allclose(
-            _qobj_data(gradient_x), finite_difference_x, rtol=1e-8, atol=1e-8
-        )
-
-        plus = amplitudes.copy()
-        minus = amplitudes.copy()
-        plus[index] += 1j * eps
-        minus[index] -= 1j * eps
-        finite_difference_y = (
-            _qobj_data(solver.envelope_propagator(plus, dt))
-            - _qobj_data(solver.envelope_propagator(minus, dt))
-        ) / (2 * eps)
-        np.testing.assert_allclose(
-            _qobj_data(gradient_y), finite_difference_y, rtol=1e-8, atol=1e-8
-        )
+    assert limited_solver._fixed_order_batch_size() == 1
+    assert limited_solver._fixed_order_batch_size(3) == 1
 
 
+def test_fixed_order_batch_defaults_to_measured_performance_tile():
+    solver = DysolvePropagator(0.31 * sigmaz(), 0.19 * sigmax(), 1.3)
 
-def test_envelope_parameter_gradients_match_quadrature_contraction():
+    assert solver.fixed_order_workspace_bytes == 256 * 1024**2
+    assert solver.fixed_order_batch_size == 512
+    assert solver._fixed_order_batch_size() == 512
+
+
+def test_multi_drive_fixed_order_batches_match_sequential_reduction():
+    dt = 0.015
+    t0 = 0.23
+    amplitudes = np.array(
+        [
+            [0.7 + 0.1j, -0.2 + 0.3j, 0.4 - 0.2j, 0.1 + 0.5j, -0.3j],
+            [0.2 - 0.4j, 0.6 + 0.2j, -0.1 + 0.3j, 0.5 - 0.2j, 0.4j],
+        ]
+    )
+    solver = DysolvePropagator.from_drives(
+        0.31 * sigmaz(),
+        [(0.19 * sigmax(), 1.3), (0.13 * sigmay(), 1.9)],
+        options={"max_order": 3, "fixed_order_workspace_bytes": 15000},
+    )
+    sequential = np.eye(2, dtype=np.complex128)
+    for subpropagator in solver._compute_envelope_subprops(amplitudes, dt, t0):
+        sequential = subpropagator @ sequential
+    expected = Qobj(sequential, solver._H_0._dims, copy=False).transform(solver._basis, True)
+
+    streaming = solver.envelope_propagator(amplitudes, dt, t0=t0)
+    prepared = solver.prepare_envelope(amplitudes, dt).propagator(t0)
+
+    np.testing.assert_allclose(_qobj_data(streaming), _qobj_data(expected), rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(_qobj_data(prepared), _qobj_data(expected), rtol=1e-12, atol=1e-12)
+
+
+def test_envelope_parameter_gradients_match_finite_difference():
     dt = 0.02
     t0 = 0.11
     amplitudes = np.array([0.7 + 0.1j, -0.2 + 0.3j, 0.4 - 0.2j])
@@ -277,28 +333,16 @@ def test_envelope_parameter_gradients_match_quadrature_contraction():
         dt,
         t0=t0,
     )
-    reference_propagator, gradients_x, gradients_y = solver.envelope_propagator(
-        amplitudes,
-        dt,
-        t0=t0,
-        gradient="quadratures",
-    )
-    expected = []
-    for derivative in derivatives:
-        gradient = 0 * reference_propagator
-        for sample_derivative, gradient_x, gradient_y in zip(
-            derivative,
-            gradients_x,
-            gradients_y,
-            strict=True,
-        ):
-            gradient += sample_derivative.real * gradient_x + sample_derivative.imag * gradient_y
-        expected.append(gradient)
-
+    reference_propagator = solver.envelope_propagator(amplitudes, dt, t0=t0)
     np.testing.assert_allclose(_qobj_data(propagator), _qobj_data(reference_propagator), rtol=1e-12, atol=1e-12)
-    for actual, expected_gradient in zip(parameter_gradients, expected, strict=True):
-        np.testing.assert_allclose(_qobj_data(actual), _qobj_data(expected_gradient), rtol=1e-12, atol=1e-12)
 
+    epsilon = 1e-6
+    for derivative, parameter_gradient in zip(derivatives, parameter_gradients, strict=True):
+        finite_difference = (
+            _qobj_data(solver.envelope_propagator(amplitudes + epsilon * derivative, dt, t0=t0))
+            - _qobj_data(solver.envelope_propagator(amplitudes - epsilon * derivative, dt, t0=t0))
+        ) / (2 * epsilon)
+        np.testing.assert_allclose(_qobj_data(parameter_gradient), finite_difference, rtol=1e-8, atol=1e-8)
 
 
 def test_multi_drive_propagator_matches_qutip_propagator():
@@ -333,10 +377,16 @@ def test_multi_drive_propagator_matches_qutip_propagator():
     )
 
 
-def test_multi_drive_envelope_gradients_match_finite_difference():
+def test_multi_drive_envelope_parameter_gradients_match_finite_difference():
     dt = 0.015
     amplitudes = np.array(
         [[0.7 + 0.1j, -0.2 + 0.3j], [0.4 - 0.2j, 0.1 + 0.5j]]
+    )
+    derivatives = np.array(
+        [
+            [[0.0, 1.0], [0.0, 0.0]],
+            [[0.0, 0.0], [1.0j, 0.0]],
+        ]
     )
     solver = DysolvePropagator.from_drives(
         0.31 * sigmaz(),
@@ -344,40 +394,15 @@ def test_multi_drive_envelope_gradients_match_finite_difference():
         options={"max_order": 3, "max_dt": dt, "a_tol": 1e-12},
     )
 
-    _, gradients_x, gradients_y = solver.envelope_propagator(
-        amplitudes, dt, gradient="quadratures"
-    )
-    eps = 1e-6
-    for drive_index, pixel_index in [(0, 1), (1, 0)]:
-        plus = amplitudes.copy()
-        minus = amplitudes.copy()
-        plus[drive_index, pixel_index] += eps
-        minus[drive_index, pixel_index] -= eps
-        finite_difference_x = (
-            _qobj_data(solver.envelope_propagator(plus, dt))
-            - _qobj_data(solver.envelope_propagator(minus, dt))
-        ) / (2 * eps)
-        np.testing.assert_allclose(
-            _qobj_data(gradients_x[drive_index][pixel_index]),
-            finite_difference_x,
-            rtol=1e-8,
-            atol=1e-8,
-        )
+    _, parameter_gradients = solver.envelope_parameter_gradients(amplitudes, derivatives, dt)
 
-        plus = amplitudes.copy()
-        minus = amplitudes.copy()
-        plus[drive_index, pixel_index] += 1j * eps
-        minus[drive_index, pixel_index] -= 1j * eps
-        finite_difference_y = (
-            _qobj_data(solver.envelope_propagator(plus, dt))
-            - _qobj_data(solver.envelope_propagator(minus, dt))
-        ) / (2 * eps)
-        np.testing.assert_allclose(
-            _qobj_data(gradients_y[drive_index][pixel_index]),
-            finite_difference_y,
-            rtol=1e-8,
-            atol=1e-8,
-        )
+    epsilon = 1e-6
+    for derivative, parameter_gradient in zip(derivatives, parameter_gradients, strict=True):
+        finite_difference = (
+            _qobj_data(solver.envelope_propagator(amplitudes + epsilon * derivative, dt))
+            - _qobj_data(solver.envelope_propagator(amplitudes - epsilon * derivative, dt))
+        ) / (2 * epsilon)
+        np.testing.assert_allclose(_qobj_data(parameter_gradient), finite_difference, rtol=1e-8, atol=1e-8)
 
 
 def test_gaussian_filter_matrix_preserves_constant_envelope():

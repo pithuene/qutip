@@ -134,10 +134,14 @@ class PreparedDysolveEnvelope:
     def propagator(self, t0: float = 0.0) -> Qobj:
         """Return the full envelope propagator for a pulse starting at ``t0``."""
         total = np.eye(self._length, dtype=np.complex128)
-        for start in range(0, self.n_subpixels, self._solver.batch_size):
-            stop = min(start + self._solver.batch_size, self.n_subpixels)
-            for subpropagator in self._subpropagators_slice(start, stop, t0):
-                total = subpropagator @ total
+        batch_size = self._solver._fixed_order_batch_size()
+        for start in range(0, self.n_subpixels, batch_size):
+            stop = min(start + batch_size, self.n_subpixels)
+            subpropagators = self._subpropagators_slice(start, stop, t0)
+            batch_product, _ = self._solver._chronological_product(subpropagators)
+            total, _ = self._solver._chronological_product(
+                np.stack((total, batch_product))
+            )
         return Qobj(total, self._solver._H_0._dims, copy=False).transform(
             self._solver._basis, True
         )
@@ -180,9 +184,20 @@ class DysolvePropagator:
 
         - "batch_size"
 
-            Number of same-dt substeps to contract at once when materializing
-            subpropagators (default is 10). Larger values reduce Python
-            overhead for small Hilbert spaces, but use more memory.
+            Number of same-dt substeps to contract at once in gradient paths
+            (default is 10).
+
+        - "fixed_order_workspace_bytes"
+
+            Transient workspace ceiling for fixed-order envelope propagation
+            and parameter gradients (default is 256 MiB). The batch size is
+            estimated conservatively from the solver and derivative shapes.
+
+        - "fixed_order_batch_size"
+
+            Performance tile for fixed-order envelope propagation and
+            parameter gradients (default is 512 steps). The workspace ceiling
+            can reduce this tile for larger systems or derivative sets.
 
         - "dt_cache_size"
 
@@ -257,13 +272,28 @@ class DysolvePropagator:
             self.a_tol = 1e-10
             self.max_dt = 0.1
             self.batch_size = 10
+            self.fixed_order_workspace_bytes = 256 * 1024 * 1024
+            self.fixed_order_batch_size = 512
             self.dt_cache_size = 64
         else:
             self.max_order = options.get('max_order', 4)
             self.max_dt = options.get('max_dt', 0.1)
             self.a_tol = options.get('a_tol', 1e-10)
             self.batch_size = options.get('batch_size', 10)
+            self.fixed_order_workspace_bytes = options.get(
+                'fixed_order_workspace_bytes', 256 * 1024 * 1024
+            )
+            self.fixed_order_batch_size = options.get(
+                'fixed_order_batch_size', 512
+            )
             self.dt_cache_size = options.get('dt_cache_size', 64)
+        positive_integer_options = {
+            "fixed_order_workspace_bytes": self.fixed_order_workspace_bytes,
+            "fixed_order_batch_size": self.fixed_order_batch_size,
+        }
+        for name, value in positive_integer_options.items():
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
         if type(self.dt_cache_size) is not int or self.dt_cache_size < 0:
             raise ValueError("dt_cache_size must be a non-negative integer")
 
@@ -406,6 +436,71 @@ class DysolvePropagator:
             step = run_stop
 
         return Us
+
+    def _fixed_order_batch_size(self, n_parameters: int = 0) -> int:
+        """Return a workspace-bounded envelope batch size."""
+        length = len(self._eigenenergies)
+        matrix_bytes = length * length * np.dtype(np.complex128).itemsize
+        matrix_count = 3
+        if n_parameters:
+            matrix_count += 2 * self._n_drives + 4 * n_parameters
+        branch_workspace_bytes = max(
+            (
+                (order + 4 + (2 * self._n_drives if n_parameters else 0))
+                * (2 * self._n_drives) ** order
+                * np.dtype(np.complex128).itemsize
+                for order in range(1, self.max_order + 1)
+            ),
+            default=0,
+        )
+        bytes_per_step = (
+            matrix_count * matrix_bytes
+            + branch_workspace_bytes
+            + np.dtype(float).itemsize
+        )
+        workspace_batch_size = max(
+            1,
+            self.fixed_order_workspace_bytes // bytes_per_step,
+        )
+        return min(self.fixed_order_batch_size, workspace_batch_size)
+
+    @staticmethod
+    def _chronological_product(
+        matrices: ArrayLike,
+        derivatives: ArrayLike | None = None,
+    ) -> tuple[ArrayLike, ArrayLike]:
+        """Reduce chronological propagators and parameter derivatives."""
+        product = np.asarray(matrices)
+        if derivatives is None:
+            product_derivatives = np.empty(
+                (0, len(product), product.shape[-2], product.shape[-1]),
+                dtype=np.complex128,
+            )
+        else:
+            product_derivatives = np.asarray(derivatives)
+            if product_derivatives.shape[1:] != product.shape:
+                raise ValueError(
+                    "derivatives must have shape "
+                    "(n_parameters, n_steps, dimension, dimension)"
+                )
+        while len(product) > 1:
+            pair_count = len(product) // 2
+            earlier = product[:2 * pair_count:2]
+            later = product[1:2 * pair_count:2]
+            reduced = later @ earlier
+            reduced_derivatives = (
+                product_derivatives[:, 1:2 * pair_count:2] @ earlier
+                + later @ product_derivatives[:, :2 * pair_count:2]
+            )
+            if len(product) % 2:
+                reduced = np.concatenate((reduced, product[-1:]))
+                reduced_derivatives = np.concatenate(
+                    (reduced_derivatives, product_derivatives[:, -1:]),
+                    axis=1,
+                )
+            product = reduced
+            product_derivatives = reduced_derivatives
+        return product[0], product_derivatives[:, 0]
 
     def _get_branch_metadata(self, n: int) -> tuple[ArrayLike, ArrayLike, ArrayLike]:
         """
@@ -782,30 +877,33 @@ class DysolvePropagator:
         parameter_gradients = np.zeros(
             (n_parameters, length, length), dtype=np.complex128
         )
-        for start in range(0, amplitudes.shape[1], self.batch_size):
-            stop = min(start + self.batch_size, amplitudes.shape[1])
-            subprops, dsubprops_dx, dsubprops_dy = self._compute_envelope_subprops(
+        batch_size = self._fixed_order_batch_size(n_parameters)
+        for start in range(0, amplitudes.shape[1], batch_size):
+            stop = min(start + batch_size, amplitudes.shape[1])
+            subpropagators, dsubprops_dx, dsubprops_dy = self._compute_envelope_subprops(
                 amplitudes[:, start:stop],
                 dt,
                 t0 + start * dt,
                 gradient=True,
             )
             batch_derivatives = derivatives[:, :, start:stop]
-            for index, subpropagator in enumerate(subprops):
-                subpropagator_derivatives = np.einsum(
-                    'pd,dij->pij',
-                    batch_derivatives[:, :, index].real,
-                    dsubprops_dx[:, index],
-                ) + np.einsum(
-                    'pd,dij->pij',
-                    batch_derivatives[:, :, index].imag,
-                    dsubprops_dy[:, index],
-                )
-                parameter_gradients = (
-                    subpropagator @ parameter_gradients
-                    + subpropagator_derivatives @ total
-                )
-                total = subpropagator @ total
+            subpropagator_derivatives = np.einsum(
+                'pdb,dbij->pbij',
+                batch_derivatives.real,
+                dsubprops_dx,
+            ) + np.einsum(
+                'pdb,dbij->pbij',
+                batch_derivatives.imag,
+                dsubprops_dy,
+            )
+            batch_product, batch_parameter_gradients = self._chronological_product(
+                subpropagators,
+                subpropagator_derivatives,
+            )
+            total, parameter_gradients = self._chronological_product(
+                np.stack((total, batch_product)),
+                np.stack((parameter_gradients, batch_parameter_gradients), axis=1),
+            )
 
         U = Qobj(total, self._H_0._dims, copy=False).transform(
             self._basis, True
@@ -823,88 +921,24 @@ class DysolvePropagator:
         amplitudes: ArrayLike,
         dt: float,
         t0: float = 0.0,
-        *,
-        gradient: bool | str = False,
-    ):
-        """
-        Propagator for piecewise-constant shaped drive envelopes.
-
-        For one drive, ``amplitudes`` may be one-dimensional.  For multiple
-        drives, it must have shape ``(n_drives, n_subpixels)``.  The Hamiltonian
-        represented by this method is
-        ``H = H0 + sum_m X_m * (x_m,l*cos(omega_m*t) + y_m,l*sin(omega_m*t))``
-        during subpixel ``l``, where ``amplitudes[m, l] = x_m,l + 1j*y_m,l``.
-
-        If ``gradient`` is false, return ``U(T, t0)`` as a ``Qobj``.  If
-        ``gradient='real'``, also return derivatives with respect to the real
-        cosine amplitudes.  If ``gradient='quadratures'``, return derivatives
-        with respect to the real and imaginary quadratures.
-        """
-        if gradient not in (False, 'real', 'quadratures'):
-            raise ValueError(
-                "gradient must be False, 'real', or 'quadratures'"
-            )
-        want_gradient = bool(gradient)
-        if not want_gradient:
-            amplitudes = self._as_drive_amplitudes(amplitudes)
-            length = len(self._eigenenergies)
-            total = np.eye(length, dtype=np.complex128)
-            for start in range(0, amplitudes.shape[1], self.batch_size):
-                stop = min(start + self.batch_size, amplitudes.shape[1])
-                subpropagators = self._compute_envelope_subprops(
-                    amplitudes[:, start:stop], dt, t0 + start * dt
-                )
-                for subpropagator in subpropagators:
-                    total = subpropagator @ total
-            return Qobj(total, self._H_0._dims, copy=False).transform(
-                self._basis, True
-            )
-
-        step_data = self._compute_envelope_subprops(
-            amplitudes, dt, t0, gradient=True
-        )
-        subprops, dsubprops_dx, dsubprops_dy = step_data
-
+    ) -> Qobj:
+        """Return the propagator for a piecewise-constant drive envelope."""
+        amplitudes = self._as_drive_amplitudes(amplitudes)
         length = len(self._eigenenergies)
-        prefixes = [np.eye(length, dtype=np.complex128)]
-        for subprop in subprops:
-            prefixes.append(subprop @ prefixes[-1])
-        total = prefixes[-1]
-        U = Qobj(total, self._H_0._dims, copy=False).transform(
+        total = np.eye(length, dtype=np.complex128)
+        batch_size = self._fixed_order_batch_size()
+        for start in range(0, amplitudes.shape[1], batch_size):
+            stop = min(start + batch_size, amplitudes.shape[1])
+            subpropagators = self._compute_envelope_subprops(
+                amplitudes[:, start:stop], dt, t0 + start * dt
+            )
+            batch_product, _ = self._chronological_product(subpropagators)
+            total, _ = self._chronological_product(
+                np.stack((total, batch_product))
+            )
+        return Qobj(total, self._H_0._dims, copy=False).transform(
             self._basis, True
         )
-        suffix = np.eye(length, dtype=np.complex128)
-        n_subpixels = len(subprops)
-        dU_dx = [[None] * n_subpixels for _ in range(self._n_drives)]
-        dU_dy = [[None] * n_subpixels for _ in range(self._n_drives)]
-        for index in range(n_subpixels - 1, -1, -1):
-            for drive_index in range(self._n_drives):
-                dU_dx[drive_index][index] = (
-                    suffix @ dsubprops_dx[drive_index, index] @ prefixes[index]
-                )
-                dU_dy[drive_index][index] = (
-                    suffix @ dsubprops_dy[drive_index, index] @ prefixes[index]
-                )
-            suffix = suffix @ subprops[index]
-
-        for drive_index in range(self._n_drives):
-            dU_dx[drive_index] = tuple(
-                Qobj(dU, self._H_0._dims, copy=False).transform(
-                    self._basis, True
-                )
-                for dU in dU_dx[drive_index]
-            )
-            dU_dy[drive_index] = tuple(
-                Qobj(dU, self._H_0._dims, copy=False).transform(
-                    self._basis, True
-                )
-                for dU in dU_dy[drive_index]
-            )
-        dU_dx = self._format_drive_gradients(dU_dx)
-        dU_dy = self._format_drive_gradients(dU_dy)
-        if gradient == 'real':
-            return U, dU_dx
-        return U, dU_dx, dU_dy
 
     def filtered_envelope_propagator(
         self,
@@ -938,53 +972,48 @@ class DysolvePropagator:
         if not gradient:
             return self.envelope_propagator(subpixels, subpixel_dt, t0)
 
-        if gradient == 'real':
-            U, dU_ds = self.envelope_propagator(
-                subpixels, subpixel_dt, t0, gradient='real'
-            )
-            dU_ds = (dU_ds,) if self._n_drives == 1 else dU_ds
-            dU_du = []
-            for drive_index in range(self._n_drives):
-                drive_gradients = []
-                for pixel_index in range(n_pixels):
-                    gradient_sum = sum(
-                        filter_matrix[subpixel_index, pixel_index]
-                        * dU_ds[drive_index][subpixel_index]
-                        for subpixel_index in range(filter_matrix.shape[0])
-                    )
-                    drive_gradients.append(gradient_sum)
-                dU_du.append(tuple(drive_gradients))
-            return U, self._format_drive_gradients(dU_du)
-
-        U, dU_dx_ds, dU_dy_ds = self.envelope_propagator(
-            subpixels, subpixel_dt, t0, gradient='quadratures'
+        parameter_count = self._n_drives * n_pixels
+        derivative_count = parameter_count if gradient == 'real' else 2 * parameter_count
+        amplitude_derivatives = np.zeros(
+            (derivative_count, self._n_drives, subpixels.shape[1]),
+            dtype=np.complex128,
         )
-        dU_dx_ds = (dU_dx_ds,) if self._n_drives == 1 else dU_dx_ds
-        dU_dy_ds = (dU_dy_ds,) if self._n_drives == 1 else dU_dy_ds
-        dU_dx_du = []
-        dU_dy_du = []
         for drive_index in range(self._n_drives):
-            drive_gradients_x = []
-            drive_gradients_y = []
-            for pixel_index in range(n_pixels):
-                gradient_sum_x = sum(
-                    filter_matrix[subpixel_index, pixel_index]
-                    * dU_dx_ds[drive_index][subpixel_index]
-                    for subpixel_index in range(filter_matrix.shape[0])
+            parameter_slice = slice(
+                drive_index * n_pixels,
+                (drive_index + 1) * n_pixels,
+            )
+            amplitude_derivatives[parameter_slice, drive_index] = filter_matrix.T
+            if gradient == 'quadratures':
+                quadrature_slice = slice(
+                    parameter_count + drive_index * n_pixels,
+                    parameter_count + (drive_index + 1) * n_pixels,
                 )
-                gradient_sum_y = sum(
-                    filter_matrix[subpixel_index, pixel_index]
-                    * dU_dy_ds[drive_index][subpixel_index]
-                    for subpixel_index in range(filter_matrix.shape[0])
-                )
-                drive_gradients_x.append(gradient_sum_x)
-                drive_gradients_y.append(gradient_sum_y)
-            dU_dx_du.append(tuple(drive_gradients_x))
-            dU_dy_du.append(tuple(drive_gradients_y))
+                amplitude_derivatives[quadrature_slice, drive_index] = 1j * filter_matrix.T
+
+        propagator, parameter_gradients = self.envelope_parameter_gradients(
+            subpixels,
+            amplitude_derivatives,
+            subpixel_dt,
+            t0,
+        )
+        real_gradients = tuple(
+            parameter_gradients[drive_index * n_pixels:(drive_index + 1) * n_pixels]
+            for drive_index in range(self._n_drives)
+        )
+        if gradient == 'real':
+            return propagator, self._format_drive_gradients(real_gradients)
+        imaginary_gradients = tuple(
+            parameter_gradients[
+                parameter_count + drive_index * n_pixels:
+                parameter_count + (drive_index + 1) * n_pixels
+            ]
+            for drive_index in range(self._n_drives)
+        )
         return (
-            U,
-            self._format_drive_gradients(dU_dx_du),
-            self._format_drive_gradients(dU_dy_du),
+            propagator,
+            self._format_drive_gradients(real_gradients),
+            self._format_drive_gradients(imaginary_gradients),
         )
 
     def _compute_interval(
