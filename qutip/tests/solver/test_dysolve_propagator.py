@@ -88,8 +88,8 @@ def test_prepared_envelope_nbytes_matches_owned_arrays():
 
     prepared = solver.prepare_envelope(amplitudes, 0.02)
     owned_array_nbytes = prepared._amplitudes.nbytes + sum(
-        omega_sums.nbytes + contractions.nbytes
-        for omega_sums, contractions in prepared._terms
+        omega_sums.nbytes + phase_charges.nbytes + contractions.nbytes
+        for omega_sums, phase_charges, contractions in prepared._terms
     )
 
     assert prepared.nbytes == owned_array_nbytes
@@ -307,6 +307,36 @@ def test_multi_drive_fixed_order_batches_match_sequential_reduction():
 
     np.testing.assert_allclose(_qobj_data(streaming), _qobj_data(expected), rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(_qobj_data(prepared), _qobj_data(expected), rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("frequencies", [(1.3, 1.9), (0.0, 1.9)])
+def test_prepared_envelope_applies_multi_drive_carrier_phases_at_runtime(frequencies):
+    dt = 0.015
+    t0 = 0.23
+    amplitudes = np.array(
+        [
+            [0.7 + 0.1j, -0.2 + 0.3j, 0.4 - 0.2j],
+            [0.2 - 0.4j, 0.6 + 0.2j, -0.1 + 0.3j],
+        ]
+    )
+    carrier_phases = np.array([0.37, -1.21])
+    solver = DysolvePropagator.from_drives(
+        0.31 * sigmaz(),
+        [(0.19 * sigmax(), frequencies[0]), (0.13 * sigmay(), frequencies[1])],
+        options={"max_order": 3},
+    )
+
+    expected = solver.envelope_propagator(
+        amplitudes * np.exp(-1j * carrier_phases[:, None]),
+        dt,
+        t0=t0,
+    )
+    actual = solver.prepare_envelope(amplitudes, dt).propagator(
+        t0,
+        carrier_phases=carrier_phases,
+    )
+
+    np.testing.assert_allclose(_qobj_data(actual), _qobj_data(expected), rtol=1e-12, atol=1e-12)
 
 
 def test_envelope_parameter_gradients_match_finite_difference():

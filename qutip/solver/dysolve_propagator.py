@@ -87,8 +87,8 @@ class PreparedDysolveEnvelope:
         excluded.
         """
         return self._amplitudes.nbytes + sum(
-            omega_sums.nbytes + contractions.nbytes
-            for omega_sums, contractions in self._terms
+            omega_sums.nbytes + phase_charges.nbytes + contractions.nbytes
+            for omega_sums, phase_charges, contractions in self._terms
         )
 
     def _prepare_terms(self):
@@ -100,7 +100,7 @@ class PreparedDysolveEnvelope:
             omega_sums = solver._get_omega_sums(n)
             amp_factors = solver._envelope_branch_factors(self._amplitudes, n)
             branch_weights = np.exp(1j * np.outer(local_times, omega_sums)) * amp_factors
-            unique_omega_sums, inverse = np.unique(omega_sums, return_inverse=True)
+            unique_omega_sums, phase_charges, inverse = solver._get_carrier_phase_groups(n)
             contractions = np.zeros(
                 (len(unique_omega_sums), self.n_subpixels, self._length, self._length),
                 dtype=np.complex128,
@@ -112,32 +112,50 @@ class PreparedDysolveEnvelope:
                     Sns[n][branch_indices],
                     axes=(1, 0),
                 )
-            terms.append((unique_omega_sums, contractions))
+            terms.append((unique_omega_sums, phase_charges, contractions))
         return tuple(terms)
 
-    def _subpropagators_slice(self, start: int, stop: int, t0: float) -> ArrayLike:
+    def _subpropagators_slice(
+        self,
+        start: int,
+        stop: int,
+        t0: float,
+        carrier_phases: ArrayLike,
+    ) -> ArrayLike:
         """Materialize one chronological slice of prepared subpropagators."""
         subpropagators = np.broadcast_to(
             self._S0, (stop - start, self._length, self._length)
         ).astype(np.complex128, copy=True)
-        for omega_sums, contractions in self._terms:
-            phases = np.exp(1j * omega_sums * float(t0))
+        for omega_sums, phase_charges, contractions in self._terms:
+            branch_phases = np.exp(
+                1j * (omega_sums * float(t0) + phase_charges @ carrier_phases)
+            )
             subpropagators += np.tensordot(
-                phases, contractions[:, start:stop], axes=(0, 0)
+                branch_phases, contractions[:, start:stop], axes=(0, 0)
             )
         return subpropagators
 
-    def subpropagators(self, t0: float = 0.0) -> ArrayLike:
-        """Return subpixel propagators for a pulse starting at ``t0``."""
-        return self._subpropagators_slice(0, self.n_subpixels, t0)
+    def subpropagators(
+        self,
+        t0: float = 0.0,
+        carrier_phases: ArrayLike | None = None,
+    ) -> ArrayLike:
+        """Return subpixel propagators with runtime carrier phases."""
+        phases = self._solver._as_carrier_phases(carrier_phases)
+        return self._subpropagators_slice(0, self.n_subpixels, t0, phases)
 
-    def propagator(self, t0: float = 0.0) -> Qobj:
-        """Return the full envelope propagator for a pulse starting at ``t0``."""
+    def propagator(
+        self,
+        t0: float = 0.0,
+        carrier_phases: ArrayLike | None = None,
+    ) -> Qobj:
+        """Return the full envelope propagator with runtime carrier phases."""
+        phases = self._solver._as_carrier_phases(carrier_phases)
         total = np.eye(self._length, dtype=np.complex128)
         batch_size = self._solver._fixed_order_batch_size()
         for start in range(0, self.n_subpixels, batch_size):
             stop = min(start + batch_size, self.n_subpixels)
-            subpropagators = self._subpropagators_slice(start, stop, t0)
+            subpropagators = self._subpropagators_slice(start, stop, t0, phases)
             batch_product, _ = self._solver._chronological_product(subpropagators)
             total, _ = self._solver._chronological_product(
                 np.stack((total, batch_product))
@@ -551,6 +569,18 @@ class DysolvePropagator:
             )
         return self._omega_sums[n]
 
+    def _get_carrier_phase_groups(self, n: int) -> tuple[ArrayLike, ArrayLike, ArrayLike]:
+        """Group branches that share time and explicit carrier-phase factors."""
+        drive_indices, signs, _ = self._get_branch_metadata(n)
+        phase_charges = np.zeros((len(drive_indices), self._n_drives), dtype=np.int_)
+        for drive_index in range(self._n_drives):
+            phase_charges[:, drive_index] = np.sum(
+                signs * (drive_indices == drive_index), axis=1
+            )
+        group_keys = np.column_stack((self._get_omega_sums(n), phase_charges))
+        unique_keys, inverse = np.unique(group_keys, axis=0, return_inverse=True)
+        return unique_keys[:, 0], unique_keys[:, 1:].astype(np.int_, copy=False), inverse
+
     def _get_matrix_element_paths(
         self, drive_indices: tuple[int, ...]
     ) -> tuple[ArrayLike, ArrayLike]:
@@ -695,6 +725,17 @@ class DysolvePropagator:
             raise ValueError("amplitudes must contain at least one subpixel")
         return amplitudes
 
+    def _as_carrier_phases(self, carrier_phases: ArrayLike | None) -> ArrayLike:
+        """Return one explicit carrier phase for every drive."""
+        if carrier_phases is None:
+            return np.zeros(self._n_drives, dtype=float)
+        phases = np.asarray(carrier_phases, dtype=float)
+        if phases.ndim == 0 and self._n_drives == 1:
+            phases = phases[None]
+        if phases.shape != (self._n_drives,):
+            raise ValueError("carrier_phases must contain one phase per drive")
+        return phases
+
     def _format_drive_gradients(self, gradients):
         """Preserve the single-drive gradient return format."""
         if self._n_drives == 1:
@@ -831,9 +872,10 @@ class DysolvePropagator:
         amplitude_bytes = self._n_drives * n_subpixels * np.dtype(np.complex128).itemsize
         term_bytes = 0
         for order in range(1, self.max_order + 1):
-            unique_omega_count = len(np.unique(self._get_omega_sums(order)))
-            term_bytes += unique_omega_count * (
+            unique_omega_sums, phase_charges, _ = self._get_carrier_phase_groups(order)
+            term_bytes += len(unique_omega_sums) * (
                 np.dtype(float).itemsize
+                + phase_charges.shape[1] * np.dtype(np.int_).itemsize
                 + n_subpixels * length * length * np.dtype(np.complex128).itemsize
             )
         return amplitude_bytes + term_bytes
@@ -848,6 +890,9 @@ class DysolvePropagator:
         amplitude_derivatives: ArrayLike,
         dt: float,
         t0: float = 0.0,
+        *,
+        carrier_phases: ArrayLike | None = None,
+        carrier_phase_derivatives: ArrayLike | None = None,
     ):
         """Return an envelope propagator and gradients for arbitrary parameters.
 
@@ -855,7 +900,9 @@ class DysolvePropagator:
         one drive it may have shape ``(n_parameters, n_subpixels)``.  For one or
         more drives it may have shape ``(n_parameters, n_drives, n_subpixels)``.
         Complex derivatives are interpreted in the same I/Q convention as
-        ``amplitudes``.
+        ``amplitudes``. ``carrier_phase_derivatives`` has shape
+        ``(n_parameters, n_drives)`` and applies the chain rule for explicit
+        runtime carrier phases.
         """
         amplitudes = self._as_drive_amplitudes(amplitudes)
         derivatives = np.asarray(amplitude_derivatives, dtype=np.complex128)
@@ -871,6 +918,21 @@ class DysolvePropagator:
             raise ValueError(
                 "amplitude_derivatives trailing dimensions must match amplitudes"
             )
+
+        phases = self._as_carrier_phases(carrier_phases)
+        if carrier_phase_derivatives is None:
+            phase_derivatives = np.zeros((n_parameters, self._n_drives), dtype=float)
+        else:
+            phase_derivatives = np.asarray(carrier_phase_derivatives, dtype=float)
+            if phase_derivatives.shape != (n_parameters, self._n_drives):
+                raise ValueError(
+                    "carrier_phase_derivatives must have shape (n_parameters, n_drives)"
+                )
+        carrier_factors = np.exp(-1j * phases)[:, None]
+        derivatives = derivatives * carrier_factors[None] - (
+            1j * amplitudes[None] * carrier_factors[None] * phase_derivatives[:, :, None]
+        )
+        amplitudes = amplitudes * carrier_factors
 
         length = len(self._eigenenergies)
         total = np.eye(length, dtype=np.complex128)
@@ -921,9 +983,12 @@ class DysolvePropagator:
         amplitudes: ArrayLike,
         dt: float,
         t0: float = 0.0,
+        *,
+        carrier_phases: ArrayLike | None = None,
     ) -> Qobj:
-        """Return the propagator for a piecewise-constant drive envelope."""
+        """Return the propagator with explicit runtime carrier phases."""
         amplitudes = self._as_drive_amplitudes(amplitudes)
+        amplitudes = amplitudes * np.exp(-1j * self._as_carrier_phases(carrier_phases))[:, None]
         length = len(self._eigenenergies)
         total = np.eye(length, dtype=np.complex128)
         batch_size = self._fixed_order_batch_size()
