@@ -322,6 +322,7 @@ class DysolvePropagator:
         self._dt_Sns = OrderedDict()
         self._omega_vectors = {}
         self._omega_sums = {}
+        self._carrier_phase_groups = {}
         self._branch_drive_indices = {}
         self._branch_signs = {}
         self._matrix_element_paths = {}
@@ -571,15 +572,21 @@ class DysolvePropagator:
 
     def _get_carrier_phase_groups(self, n: int) -> tuple[ArrayLike, ArrayLike, ArrayLike]:
         """Group branches that share time and explicit carrier-phase factors."""
-        drive_indices, signs, _ = self._get_branch_metadata(n)
-        phase_charges = np.zeros((len(drive_indices), self._n_drives), dtype=np.int_)
-        for drive_index in range(self._n_drives):
-            phase_charges[:, drive_index] = np.sum(
-                signs * (drive_indices == drive_index), axis=1
+        if n not in self._carrier_phase_groups:
+            drive_indices, signs, _ = self._get_branch_metadata(n)
+            phase_charges = np.zeros((len(drive_indices), self._n_drives), dtype=np.int_)
+            for drive_index in range(self._n_drives):
+                phase_charges[:, drive_index] = np.sum(
+                    signs * (drive_indices == drive_index), axis=1
+                )
+            group_keys = np.column_stack((self._get_omega_sums(n), phase_charges))
+            unique_keys, inverse = np.unique(group_keys, axis=0, return_inverse=True)
+            self._carrier_phase_groups[n] = (
+                unique_keys[:, 0],
+                unique_keys[:, 1:].astype(np.int_, copy=False),
+                inverse,
             )
-        group_keys = np.column_stack((self._get_omega_sums(n), phase_charges))
-        unique_keys, inverse = np.unique(group_keys, axis=0, return_inverse=True)
-        return unique_keys[:, 0], unique_keys[:, 1:].astype(np.int_, copy=False), inverse
+        return self._carrier_phase_groups[n]
 
     def _get_matrix_element_paths(
         self, drive_indices: tuple[int, ...]

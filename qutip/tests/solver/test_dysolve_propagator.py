@@ -96,6 +96,20 @@ def test_prepared_envelope_nbytes_matches_owned_arrays():
     assert prepared.nbytes == solver.estimate_prepared_envelope_nbytes(len(amplitudes))
 
 
+def test_carrier_phase_groups_are_memoized_per_order():
+    solver = DysolvePropagator(
+        0.31 * sigmaz(),
+        0.19 * sigmax(),
+        1.3,
+        options={"max_order": 2},
+    )
+
+    groups = solver._get_carrier_phase_groups(2)
+
+    assert solver._get_carrier_phase_groups(2) is groups
+    assert solver._carrier_phase_groups == {2: groups}
+
+
 def test_timestep_tensor_cache_evicts_by_lru_and_recomputes():
     solver = DysolvePropagator(
         0.31 * sigmaz(),
