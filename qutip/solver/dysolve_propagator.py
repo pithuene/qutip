@@ -891,6 +891,61 @@ class DysolvePropagator:
         """Prepare a reusable t0-independent envelope contraction."""
         return PreparedDysolveEnvelope(self, amplitudes, dt)
 
+    def envelope_propagator_vjp(
+        self,
+        amplitudes: ArrayLike,
+        propagator_cotangent: Qobj,
+        dt: float,
+        t0: float = 0.0,
+        *,
+        carrier_phases: ArrayLike | None = None,
+    ) -> tuple[Qobj, ArrayLike, ArrayLike]:
+        """Return a propagator and its reverse-mode envelope gradients.
+
+        The cotangent follows the real scalar convention
+        ``dF = real(trace(cotangent.dag() * dU))``. The returned complex
+        envelope cotangent satisfies ``dF = real(vdot(cotangent, dA))``.
+        Carrier-phase gradients contain one real value per drive.
+        """
+        amplitudes = self._as_drive_amplitudes(amplitudes)
+        phases = self._as_carrier_phases(carrier_phases)
+        carrier_factors = np.exp(-1j * phases)[:, None]
+        effective_amplitudes = amplitudes * carrier_factors
+        subpropagators, derivatives_x, derivatives_y = self._compute_envelope_subprops(
+            effective_amplitudes,
+            dt,
+            t0,
+            gradient=True,
+        )
+
+        length = len(self._eigenenergies)
+        step_count = subpropagators.shape[0]
+        prefixes = np.empty((step_count + 1, length, length), dtype=np.complex128)
+        prefixes[0] = np.eye(length, dtype=np.complex128)
+        for step_index, subpropagator in enumerate(subpropagators):
+            prefixes[step_index + 1] = subpropagator @ prefixes[step_index]
+
+        suffixes = np.empty((step_count, length, length), dtype=np.complex128)
+        running_suffix = np.eye(length, dtype=np.complex128)
+        for step_index in range(step_count - 1, -1, -1):
+            suffixes[step_index] = running_suffix
+            running_suffix = running_suffix @ subpropagators[step_index]
+
+        cotangent = propagator_cotangent.transform(self._basis).full()
+        local_cotangents = np.empty_like(subpropagators)
+        for step_index in range(step_count):
+            local_cotangents[step_index] = (
+                suffixes[step_index].conj().T @ cotangent @ prefixes[step_index].conj().T
+            )
+        gradients_x = np.real(np.einsum('kij,dkij->dk', local_cotangents.conj(), derivatives_x))
+        gradients_y = np.real(np.einsum('kij,dkij->dk', local_cotangents.conj(), derivatives_y))
+        effective_cotangent = gradients_x + 1j * gradients_y
+        amplitude_cotangent = effective_cotangent * carrier_factors.conj()
+        carrier_phase_gradients = np.real(np.sum(np.conj(effective_cotangent) * (-1j * effective_amplitudes), axis=1))
+
+        propagator = Qobj(prefixes[-1], self._H_0._dims, copy=False).transform(self._basis, True)
+        return propagator, amplitude_cotangent, carrier_phase_gradients
+
     def envelope_parameter_gradients(
         self,
         amplitudes: ArrayLike,

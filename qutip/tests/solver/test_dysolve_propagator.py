@@ -389,6 +389,51 @@ def test_envelope_parameter_gradients_match_finite_difference():
         np.testing.assert_allclose(_qobj_data(parameter_gradient), finite_difference, rtol=1e-8, atol=1e-8)
 
 
+def test_envelope_propagator_vjp_matches_forward_parameter_gradients():
+    dt = 0.015
+    t0 = 0.07
+    amplitudes = np.array(
+        [[0.7 + 0.1j, -0.2 + 0.3j], [0.4 - 0.2j, 0.1 + 0.5j]]
+    )
+    amplitude_derivatives = np.array(
+        [
+            [[0.3 + 0.2j, 0.1 - 0.4j], [0.0, 0.2j]],
+            [[0.0, -0.1j], [0.5 + 0.1j, -0.2]],
+        ]
+    )
+    carrier_phases = np.array([0.2, -0.3])
+    phase_derivatives = np.array([[0.1, -0.2], [0.0, 0.4]])
+    solver = DysolvePropagator.from_drives(
+        0.31 * sigmaz(),
+        [(0.19 * sigmax(), 1.3), (0.13 * sigmay(), 1.9)],
+        options={"max_order": 3, "max_dt": dt, "a_tol": 1e-12},
+    )
+    cotangent = 0.4 * qeye(2) + (0.2 + 0.1j) * sigmax() - 0.3j * sigmay()
+
+    forward_propagator, forward_gradients = solver.envelope_parameter_gradients(
+        amplitudes,
+        amplitude_derivatives,
+        dt,
+        t0=t0,
+        carrier_phases=carrier_phases,
+        carrier_phase_derivatives=phase_derivatives,
+    )
+    reverse_propagator, amplitude_cotangent, phase_gradients = solver.envelope_propagator_vjp(
+        amplitudes,
+        cotangent,
+        dt,
+        t0=t0,
+        carrier_phases=carrier_phases,
+    )
+
+    np.testing.assert_allclose(_qobj_data(reverse_propagator), _qobj_data(forward_propagator), atol=1e-12)
+    for parameter_index, forward_gradient in enumerate(forward_gradients):
+        expected = np.real(np.vdot(_qobj_data(cotangent), _qobj_data(forward_gradient)))
+        actual = np.real(np.vdot(amplitude_cotangent, amplitude_derivatives[parameter_index]))
+        actual += phase_gradients @ phase_derivatives[parameter_index]
+        assert actual == pytest.approx(expected, rel=1e-10, abs=1e-11)
+
+
 def test_multi_drive_propagator_matches_qutip_propagator():
     H_0 = 0.37 * sigmaz()
     X_0 = 0.11 * sigmax()
