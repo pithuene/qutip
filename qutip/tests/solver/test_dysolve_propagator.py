@@ -406,7 +406,12 @@ def test_envelope_propagator_vjp_matches_forward_parameter_gradients():
     solver = DysolvePropagator.from_drives(
         0.31 * sigmaz(),
         [(0.19 * sigmax(), 1.3), (0.13 * sigmay(), 1.9)],
-        options={"max_order": 3, "max_dt": dt, "a_tol": 1e-12},
+        options={
+            "max_order": 3,
+            "max_dt": dt,
+            "a_tol": 1e-12,
+            "fixed_order_batch_size": 1,
+        },
     )
     cotangent = 0.4 * qeye(2) + (0.2 + 0.1j) * sigmax() - 0.3j * sigmay()
 

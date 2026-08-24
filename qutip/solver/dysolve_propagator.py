@@ -911,39 +911,59 @@ class DysolvePropagator:
         phases = self._as_carrier_phases(carrier_phases)
         carrier_factors = np.exp(-1j * phases)[:, None]
         effective_amplitudes = amplitudes * carrier_factors
-        subpropagators, derivatives_x, derivatives_y = self._compute_envelope_subprops(
-            effective_amplitudes,
-            dt,
-            t0,
-            gradient=True,
-        )
-
         length = len(self._eigenenergies)
-        step_count = subpropagators.shape[0]
-        prefixes = np.empty((step_count + 1, length, length), dtype=np.complex128)
-        prefixes[0] = np.eye(length, dtype=np.complex128)
-        for step_index, subpropagator in enumerate(subpropagators):
-            prefixes[step_index + 1] = subpropagator @ prefixes[step_index]
+        step_count = effective_amplitudes.shape[1]
+        batch_size = self._fixed_order_batch_size(1)
+        batch_starts = tuple(range(0, step_count, batch_size))
 
-        suffixes = np.empty((step_count, length, length), dtype=np.complex128)
-        running_suffix = np.eye(length, dtype=np.complex128)
-        for step_index in range(step_count - 1, -1, -1):
-            suffixes[step_index] = running_suffix
-            running_suffix = running_suffix @ subpropagators[step_index]
+        boundary_prefixes = [np.eye(length, dtype=np.complex128)]
+        for start in batch_starts:
+            stop = min(start + batch_size, step_count)
+            subpropagators = self._compute_envelope_subprops(
+                effective_amplitudes[:, start:stop],
+                dt,
+                t0 + start * dt,
+            )
+            batch_product, _ = self._chronological_product(subpropagators)
+            boundary_prefixes.append(batch_product @ boundary_prefixes[-1])
 
         cotangent = propagator_cotangent.transform(self._basis).full()
-        local_cotangents = np.empty_like(subpropagators)
-        for step_index in range(step_count):
-            local_cotangents[step_index] = (
-                suffixes[step_index].conj().T @ cotangent @ prefixes[step_index].conj().T
+        effective_cotangent = np.empty_like(effective_amplitudes, dtype=np.complex128)
+        running_suffix = np.eye(length, dtype=np.complex128)
+        for batch_index in range(len(batch_starts) - 1, -1, -1):
+            start = batch_starts[batch_index]
+            stop = min(start + batch_size, step_count)
+            subpropagators, derivatives_x, derivatives_y = self._compute_envelope_subprops(
+                effective_amplitudes[:, start:stop],
+                dt,
+                t0 + start * dt,
+                gradient=True,
             )
-        gradients_x = np.real(np.einsum('kij,dkij->dk', local_cotangents.conj(), derivatives_x))
-        gradients_y = np.real(np.einsum('kij,dkij->dk', local_cotangents.conj(), derivatives_y))
-        effective_cotangent = gradients_x + 1j * gradients_y
+            local_step_count = stop - start
+            prefixes = np.empty((local_step_count + 1, length, length), dtype=np.complex128)
+            prefixes[0] = boundary_prefixes[batch_index]
+            for step_index, subpropagator in enumerate(subpropagators):
+                prefixes[step_index + 1] = subpropagator @ prefixes[step_index]
+
+            suffixes = np.empty((local_step_count, length, length), dtype=np.complex128)
+            local_suffix = running_suffix
+            for step_index in range(local_step_count - 1, -1, -1):
+                suffixes[step_index] = local_suffix
+                local_suffix = local_suffix @ subpropagators[step_index]
+
+            local_cotangents = np.empty_like(subpropagators)
+            for step_index in range(local_step_count):
+                local_cotangents[step_index] = (
+                    suffixes[step_index].conj().T @ cotangent @ prefixes[step_index].conj().T
+                )
+            gradients_x = np.real(np.einsum('kij,dkij->dk', local_cotangents.conj(), derivatives_x))
+            gradients_y = np.real(np.einsum('kij,dkij->dk', local_cotangents.conj(), derivatives_y))
+            effective_cotangent[:, start:stop] = gradients_x + 1j * gradients_y
+            running_suffix = local_suffix
         amplitude_cotangent = effective_cotangent * carrier_factors.conj()
         carrier_phase_gradients = np.real(np.sum(np.conj(effective_cotangent) * (-1j * effective_amplitudes), axis=1))
 
-        propagator = Qobj(prefixes[-1], self._H_0._dims, copy=False).transform(self._basis, True)
+        propagator = Qobj(boundary_prefixes[-1], self._H_0._dims, copy=False).transform(self._basis, True)
         return propagator, amplitude_cotangent, carrier_phase_gradients
 
     def envelope_parameter_gradients(
