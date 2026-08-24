@@ -57,62 +57,55 @@ def gaussian_filter_matrix(
 
 
 class PreparedDysolveEnvelope:
-    """Prepared t0-independent Dysolve contraction for a fixed envelope.
+    """Prepared t0-independent branch weights for a fixed envelope.
 
-    The expensive envelope-amplitude contraction is prepared once for a fixed
-    subpixel amplitude vector and timestep.  Absolute pulse start time remains
-    a runtime input through carrier phase factors, so this object can be reused
-    by identical pulses placed at different times.
+    Envelope and local-time factors are prepared once. Absolute start time and
+    carrier phases remain runtime inputs, so identical pulses can be reused at
+    different placements without storing per-phase-group matrices.
     """
 
     def __init__(self, solver, amplitudes: ArrayLike, dt: float):
         self._solver = solver
         self.dt = solver.canonical_time_step(dt)
-        self._amplitudes = np.array(
+        amplitudes = np.array(
             solver._as_drive_amplitudes(amplitudes),
             dtype=np.complex128,
             order='C',
             copy=True,
         )
-        self.n_subpixels = int(self._amplitudes.shape[1])
+        self.n_subpixels = int(amplitudes.shape[1])
         self._length = len(solver._eigenenergies)
         self._S0 = solver._compute_Sns(self.dt)[0]
-        self._terms = self._prepare_terms()
+        self._terms = self._prepare_terms(amplitudes)
 
     @property
     def nbytes(self) -> int:
-        """Return bytes in arrays owned only by this prepared envelope.
-
-        Shared solver tensors such as ``_S0`` and cached Dyson tensors are
-        excluded.
-        """
-        return self._amplitudes.nbytes + sum(
-            omega_sums.nbytes + phase_charges.nbytes + contractions.nbytes
-            for omega_sums, phase_charges, contractions in self._terms
+        """Return bytes in arrays owned only by this prepared envelope."""
+        return sum(
+            phase_charges.nbytes + branch_weights.nbytes
+            for _, phase_charges, branch_weights, _ in self._terms
         )
 
-    def _prepare_terms(self):
+    def _prepare_terms(self, amplitudes: ArrayLike):
         solver = self._solver
         local_times = np.arange(self.n_subpixels, dtype=float) * self.dt
         Sns = solver._compute_Sns(self.dt)
         terms = []
         for n in range(1, solver.max_order + 1):
             omega_sums = solver._get_omega_sums(n)
-            amp_factors = solver._envelope_branch_factors(self._amplitudes, n)
-            branch_weights = np.exp(1j * np.outer(local_times, omega_sums)) * amp_factors
-            unique_omega_sums, phase_charges, inverse = solver._get_carrier_phase_groups(n)
-            contractions = np.zeros(
-                (len(unique_omega_sums), self.n_subpixels, self._length, self._length),
-                dtype=np.complex128,
+            amplitude_factors = solver._envelope_branch_factors(amplitudes, n)
+            branch_weights = (
+                np.exp(1j * np.outer(local_times, omega_sums)) * amplitude_factors
             )
-            for group_index in range(len(unique_omega_sums)):
-                branch_indices = inverse == group_index
-                contractions[group_index] = np.tensordot(
-                    branch_weights[:, branch_indices],
-                    Sns[n][branch_indices],
-                    axes=(1, 0),
+            drive_indices, signs, _ = solver._get_branch_metadata(n)
+            phase_charges = np.zeros(
+                (len(drive_indices), solver._n_drives), dtype=np.int_
+            )
+            for drive_index in range(solver._n_drives):
+                phase_charges[:, drive_index] = np.sum(
+                    signs * (drive_indices == drive_index), axis=1
                 )
-            terms.append((unique_omega_sums, phase_charges, contractions))
+            terms.append((omega_sums, phase_charges, branch_weights, Sns[n]))
         return tuple(terms)
 
     def _subpropagators_slice(
@@ -126,12 +119,14 @@ class PreparedDysolveEnvelope:
         subpropagators = np.broadcast_to(
             self._S0, (stop - start, self._length, self._length)
         ).astype(np.complex128, copy=True)
-        for omega_sums, phase_charges, contractions in self._terms:
+        for omega_sums, phase_charges, branch_weights, Sn in self._terms:
             branch_phases = np.exp(
                 1j * (omega_sums * float(t0) + phase_charges @ carrier_phases)
             )
             subpropagators += np.tensordot(
-                branch_phases, contractions[:, start:stop], axes=(0, 0)
+                branch_weights[start:stop] * branch_phases,
+                Sn,
+                axes=(1, 0),
             )
         return subpropagators
 
@@ -322,7 +317,6 @@ class DysolvePropagator:
         self._dt_Sns = OrderedDict()
         self._omega_vectors = {}
         self._omega_sums = {}
-        self._carrier_phase_groups = {}
         self._branch_drive_indices = {}
         self._branch_signs = {}
         self._matrix_element_paths = {}
@@ -569,24 +563,6 @@ class DysolvePropagator:
                 np.sum(self._get_omega_vectors(n), axis=1), dtype=float
             )
         return self._omega_sums[n]
-
-    def _get_carrier_phase_groups(self, n: int) -> tuple[ArrayLike, ArrayLike, ArrayLike]:
-        """Group branches that share time and explicit carrier-phase factors."""
-        if n not in self._carrier_phase_groups:
-            drive_indices, signs, _ = self._get_branch_metadata(n)
-            phase_charges = np.zeros((len(drive_indices), self._n_drives), dtype=np.int_)
-            for drive_index in range(self._n_drives):
-                phase_charges[:, drive_index] = np.sum(
-                    signs * (drive_indices == drive_index), axis=1
-                )
-            group_keys = np.column_stack((self._get_omega_sums(n), phase_charges))
-            unique_keys, inverse = np.unique(group_keys, axis=0, return_inverse=True)
-            self._carrier_phase_groups[n] = (
-                unique_keys[:, 0],
-                unique_keys[:, 1:].astype(np.int_, copy=False),
-                inverse,
-            )
-        return self._carrier_phase_groups[n]
 
     def _get_matrix_element_paths(
         self, drive_indices: tuple[int, ...]
@@ -875,20 +851,17 @@ class DysolvePropagator:
         """
         if n_subpixels <= 0:
             raise ValueError("n_subpixels must be positive")
-        length = len(self._eigenenergies)
-        amplitude_bytes = self._n_drives * n_subpixels * np.dtype(np.complex128).itemsize
         term_bytes = 0
         for order in range(1, self.max_order + 1):
-            unique_omega_sums, phase_charges, _ = self._get_carrier_phase_groups(order)
-            term_bytes += len(unique_omega_sums) * (
-                np.dtype(float).itemsize
-                + phase_charges.shape[1] * np.dtype(np.int_).itemsize
-                + n_subpixels * length * length * np.dtype(np.complex128).itemsize
+            branch_count = (2 * self._n_drives) ** order
+            term_bytes += branch_count * (
+                self._n_drives * np.dtype(np.int_).itemsize
+                + n_subpixels * np.dtype(np.complex128).itemsize
             )
-        return amplitude_bytes + term_bytes
+        return term_bytes
 
     def prepare_envelope(self, amplitudes: ArrayLike, dt: float) -> PreparedDysolveEnvelope:
-        """Prepare a reusable t0-independent envelope contraction."""
+        """Prepare reusable t0-independent envelope branch weights."""
         return PreparedDysolveEnvelope(self, amplitudes, dt)
 
     def envelope_propagator_vjp(

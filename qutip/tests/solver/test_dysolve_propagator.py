@@ -87,27 +87,31 @@ def test_prepared_envelope_nbytes_matches_owned_arrays():
     )
 
     prepared = solver.prepare_envelope(amplitudes, 0.02)
-    owned_array_nbytes = prepared._amplitudes.nbytes + sum(
-        omega_sums.nbytes + phase_charges.nbytes + contractions.nbytes
-        for omega_sums, phase_charges, contractions in prepared._terms
+    owned_array_nbytes = sum(
+        phase_charges.nbytes + branch_weights.nbytes
+        for _, phase_charges, branch_weights, _ in prepared._terms
     )
 
     assert prepared.nbytes == owned_array_nbytes
     assert prepared.nbytes == solver.estimate_prepared_envelope_nbytes(len(amplitudes))
 
 
-def test_carrier_phase_groups_are_memoized_per_order():
-    solver = DysolvePropagator(
+def test_prepared_envelope_stores_scalar_branch_weights():
+    amplitudes = np.array(
+        [[0.7 + 0.1j, -0.2 + 0.3j], [0.4 - 0.2j, 0.1 + 0.5j]]
+    )
+    solver = DysolvePropagator.from_drives(
         0.31 * sigmaz(),
-        0.19 * sigmax(),
-        1.3,
+        [(0.19 * sigmax(), 1.3), (0.13 * sigmay(), 1.9)],
         options={"max_order": 2},
     )
 
-    groups = solver._get_carrier_phase_groups(2)
+    prepared = solver.prepare_envelope(amplitudes, 0.02)
 
-    assert solver._get_carrier_phase_groups(2) is groups
-    assert solver._carrier_phase_groups == {2: groups}
+    for omega_sums, phase_charges, branch_weights, Sn in prepared._terms:
+        assert branch_weights.shape == (amplitudes.shape[1], len(omega_sums))
+        assert phase_charges.shape == (len(omega_sums), amplitudes.shape[0])
+        assert Sn.shape[0] == len(omega_sums)
 
 
 def test_timestep_tensor_cache_evicts_by_lru_and_recomputes():
