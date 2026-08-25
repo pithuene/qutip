@@ -11,7 +11,7 @@ from scipy.special import erf
 
 from qutip import Qobj, qeye_like
 
-from .cy.dysolve import cy_compute_Sn
+from .cy.dysolve import cy_compute_Sn, cy_control_polynomial_vjp
 
 __all__ = [
     'DysolveEnvelopePropagation',
@@ -672,10 +672,10 @@ class DysolvePropagator:
                 )
 
         length = len(self._eigenenergies)
-        positive_counts = np.asarray(positive_counts, dtype=np.int_).reshape(
+        positive_counts = np.asarray(positive_counts, dtype=np.int64).reshape(
             -1, self._n_drives
         )
-        negative_counts = np.asarray(negative_counts, dtype=np.int_).reshape(
+        negative_counts = np.asarray(negative_counts, dtype=np.int64).reshape(
             -1, self._n_drives
         )
         polynomial = _DysolveControlPolynomial(
@@ -1045,39 +1045,42 @@ class DysolvePropagator:
                 raise ValueError("forward_propagation uses another envelope length")
             boundary_prefixes = forward_propagation.boundary_prefixes
 
-        cotangent = propagator_cotangent.transform(self._basis).full()
-        effective_cotangent = np.empty_like(effective_amplitudes, dtype=np.complex128)
+        cotangent = np.ascontiguousarray(
+            propagator_cotangent.transform(self._basis).full(),
+            dtype=np.complex128,
+        )
+        polynomial = self._compute_control_polynomial(dt)
+        effective_cotangent = np.empty_like(
+            effective_amplitudes, dtype=np.complex128
+        )
         running_suffix = np.eye(length, dtype=np.complex128)
         for batch_index in range(len(batch_starts) - 1, -1, -1):
             start = batch_starts[batch_index]
             stop = min(start + batch_size, step_count)
-            subpropagators, derivatives_x, derivatives_y = self._compute_envelope_subprops(
-                effective_amplitudes[:, start:stop],
-                dt,
-                t0 + start * dt,
-                gradient=True,
+            current_times = (
+                t0
+                + start * dt
+                + np.arange(stop - start, dtype=float) * dt
             )
-            local_step_count = stop - start
-            prefixes = np.empty((local_step_count + 1, length, length), dtype=np.complex128)
-            prefixes[0] = boundary_prefixes[batch_index]
-            for step_index, subpropagator in enumerate(subpropagators):
-                prefixes[step_index + 1] = subpropagator @ prefixes[step_index]
-
-            suffixes = np.empty((local_step_count, length, length), dtype=np.complex128)
-            local_suffix = running_suffix
-            for step_index in range(local_step_count - 1, -1, -1):
-                suffixes[step_index] = local_suffix
-                local_suffix = local_suffix @ subpropagators[step_index]
-
-            local_cotangents = np.empty_like(subpropagators)
-            for step_index in range(local_step_count):
-                local_cotangents[step_index] = (
-                    suffixes[step_index].conj().T @ cotangent @ prefixes[step_index].conj().T
-                )
-            gradients_x = np.real(np.einsum('kij,dkij->dk', local_cotangents.conj(), derivatives_x))
-            gradients_y = np.real(np.einsum('kij,dkij->dk', local_cotangents.conj(), derivatives_y))
-            effective_cotangent[:, start:stop] = gradients_x + 1j * gradients_y
-            running_suffix = local_suffix
+            rotations = np.exp(-1j * np.outer(self._omegas, current_times))
+            rotated_amplitudes = (
+                effective_amplitudes[:, start:stop] * rotations
+            )
+            # Fuse polynomial evaluation and chronological adjoint scanning.
+            batch_cotangent, running_suffix = cy_control_polynomial_vjp(
+                np.ascontiguousarray(
+                    rotated_amplitudes, dtype=np.complex128
+                ),
+                np.ascontiguousarray(rotations, dtype=np.complex128),
+                polynomial.positive_counts,
+                polynomial.negative_counts,
+                polynomial.coefficients,
+                polynomial.free_propagator,
+                cotangent,
+                boundary_prefixes[batch_index],
+                running_suffix,
+            )
+            effective_cotangent[:, start:stop] = batch_cotangent
         amplitude_cotangent = effective_cotangent * carrier_factors.conj()
         carrier_phase_gradients = np.real(np.sum(np.conj(effective_cotangent) * (-1j * effective_amplitudes), axis=1))
 

@@ -510,7 +510,44 @@ def test_envelope_parameter_gradients_match_finite_difference():
         np.testing.assert_allclose(_qobj_data(parameter_gradient), finite_difference, rtol=1e-8, atol=1e-8)
 
 
-def test_retained_propagation_skips_forward_reconstruction(monkeypatch):
+def test_envelope_vjp_is_finite_at_zero_multi_drive_amplitude():
+    dt = 0.015
+    amplitudes = np.zeros((2, 2), dtype=np.complex128)
+    directions = np.array(
+        [
+            [[1.0, 0.0], [0.0, 0.0]],
+            [[0.0, 1.0j], [0.0, 0.0]],
+            [[0.0, 0.0], [1.0, 0.0]],
+            [[0.0, 0.0], [0.0, 1.0j]],
+        ]
+    )
+    solver = DysolvePropagator.from_drives(
+        0.31 * sigmaz(),
+        [(0.19 * sigmax(), 1.3), (0.13 * sigmay(), 1.9)],
+        options={"max_order": 4, "fixed_order_batch_size": 1},
+    )
+    cotangent = 0.4 * qeye(2) + 0.2j * sigmax()
+
+    _, forward_gradients = solver.envelope_parameter_gradients(
+        amplitudes,
+        directions,
+        dt,
+    )
+    _, amplitude_cotangent, phase_gradients = (
+        solver.envelope_propagator_vjp(amplitudes, cotangent, dt)
+    )
+
+    assert np.all(np.isfinite(amplitude_cotangent))
+    assert np.all(np.isfinite(phase_gradients))
+    for direction, forward_gradient in zip(
+        directions, forward_gradients, strict=True
+    ):
+        expected = np.real(np.vdot(cotangent.full(), forward_gradient.full()))
+        actual = np.real(np.vdot(amplitude_cotangent, direction))
+        assert actual == pytest.approx(expected, rel=1e-12, abs=1e-12)
+
+
+def test_retained_propagation_uses_native_reverse_kernel(monkeypatch):
     dt = 0.015
     t0 = 0.07
     amplitudes = np.array(
@@ -537,18 +574,15 @@ def test_retained_propagation_skips_forward_reconstruction(monkeypatch):
 
     assert not hasattr(forward, "subpropagators")
     assert len(forward.boundary_prefixes) == 3
-    original_subpropagators = solver._compute_envelope_subprops
-
-    def require_reverse_derivatives(*args, **kwargs):
-        assert kwargs.get("gradient"), (
-            "retained propagation must skip forward-only reconstruction"
+    def reject_python_subpropagators(*args, **kwargs):
+        raise AssertionError(
+            "retained reverse mode must use the fused native kernel"
         )
-        return original_subpropagators(*args, **kwargs)
 
     monkeypatch.setattr(
         solver,
         "_compute_envelope_subprops",
-        require_reverse_derivatives,
+        reject_python_subpropagators,
     )
     actual = solver.envelope_propagator_vjp(
         amplitudes,
