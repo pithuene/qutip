@@ -16,6 +16,7 @@ from qutip import (
 from qutip.solver import propagator
 from qutip.solver.cy.dysolve import cy_compute_integrals
 from qutip.solver.dysolve_propagator import (
+    DysolveKernelCache,
     DysolvePropagator,
     dysolve_propagator,
     gaussian_filter_matrix,
@@ -209,6 +210,173 @@ def test_control_polynomial_gradients_are_finite_at_zero_amplitude():
             rtol=1e-10,
             atol=1e-10,
         )
+
+
+def test_explicit_kernel_cache_shares_immutable_solver_tensors():
+    cache = DysolveKernelCache(maximum_entries=2)
+    first_solver = DysolvePropagator(
+        0.31 * sigmaz(),
+        0.19 * sigmax(),
+        1.3,
+        options={"max_order": 3},
+        kernel_cache=cache,
+    )
+    second_solver = DysolvePropagator(
+        0.31 * sigmaz(),
+        0.19 * sigmax(),
+        1.3,
+        options={"max_order": 3},
+        kernel_cache=cache,
+    )
+
+    first_polynomial = first_solver._compute_control_polynomial(0.015)
+    second_polynomial = second_solver._compute_control_polynomial(0.015)
+
+    assert first_polynomial is second_polynomial
+    assert not first_solver._dt_Sns
+    assert not second_solver._dt_Sns
+    assert not first_solver._control_polynomials
+    assert not second_solver._control_polynomials
+    assert all(not tensor.flags.writeable for tensor in first_polynomial)
+    with pytest.raises(ValueError):
+        first_polynomial.coefficients[0, 0, 0] = 0
+    _, amplitude_cotangent, phase_gradients = (
+        second_solver.envelope_propagator_vjp(
+            np.array([0.1 + 0.2j, -0.3j]),
+            qeye(2),
+            0.015,
+        )
+    )
+    assert np.all(np.isfinite(amplitude_cotangent))
+    assert np.all(np.isfinite(phase_gradients))
+
+    info = cache.cache_info()
+    assert info.hits >= 3
+    assert info.misses == 1
+    assert info.insertions == 1
+    assert info.current_entries == 1
+    assert info.maximum_entries == 2
+    assert info.current_bytes == sum(
+        tensor.nbytes for tensor in first_polynomial
+    )
+
+
+def test_kernel_cache_keys_include_solver_physics_and_order():
+    cache = DysolveKernelCache()
+    reference = DysolvePropagator(
+        0.31 * sigmaz(),
+        0.19 * sigmax(),
+        1.3,
+        options={"max_order": 2},
+        kernel_cache=cache,
+    )._compute_control_polynomial(0.015)
+    other_frequency = DysolvePropagator(
+        0.31 * sigmaz(),
+        0.19 * sigmax(),
+        1.9,
+        options={"max_order": 2},
+        kernel_cache=cache,
+    )._compute_control_polynomial(0.015)
+    other_drive = DysolvePropagator(
+        0.31 * sigmaz(),
+        0.17 * sigmay(),
+        1.3,
+        options={"max_order": 2},
+        kernel_cache=cache,
+    )._compute_control_polynomial(0.015)
+    other_order = DysolvePropagator(
+        0.31 * sigmaz(),
+        0.19 * sigmax(),
+        1.3,
+        options={"max_order": 3},
+        kernel_cache=cache,
+    )._compute_control_polynomial(0.015)
+    other_tolerance = DysolvePropagator(
+        0.31 * sigmaz(),
+        0.19 * sigmax(),
+        1.3,
+        options={"max_order": 2, "a_tol": 1e-6},
+        kernel_cache=cache,
+    )._compute_control_polynomial(0.015)
+
+    assert reference is not other_frequency
+    assert reference is not other_drive
+    assert reference is not other_order
+    assert reference is not other_tolerance
+    assert cache.cache_info().current_entries == 5
+
+
+def test_kernel_cache_evicts_whole_timestep_kernels_by_lru():
+    cache = DysolveKernelCache(maximum_entries=1)
+    solver = DysolvePropagator(
+        0.31 * sigmaz(),
+        0.19 * sigmax(),
+        1.3,
+        options={"max_order": 2},
+        kernel_cache=cache,
+    )
+    first = solver._compute_control_polynomial(0.01)
+    solver._compute_control_polynomial(0.02)
+
+    recomputed_first = solver._compute_control_polynomial(0.01)
+
+    assert recomputed_first is not first
+    assert cache.cache_info().current_entries == 1
+    assert cache.cache_info().evictions == 2
+
+
+def test_disabled_kernel_cache_bypasses_storage():
+    cache = DysolveKernelCache(maximum_entries=0)
+    first_solver = DysolvePropagator(
+        0.31 * sigmaz(), 0.19 * sigmax(), 1.3, kernel_cache=cache
+    )
+    second_solver = DysolvePropagator(
+        0.31 * sigmaz(), 0.19 * sigmax(), 1.3, kernel_cache=cache
+    )
+
+    first = first_solver._compute_control_polynomial(0.015)
+    second = second_solver._compute_control_polynomial(0.015)
+
+    assert first is not second
+    assert cache.cache_info().current_entries == 0
+    assert cache.cache_info().bypasses > 0
+
+
+def test_solver_rejects_invalid_kernel_cache():
+    with pytest.raises(TypeError, match="kernel_cache"):
+        DysolvePropagator(
+            0.31 * sigmaz(),
+            0.19 * sigmax(),
+            1.3,
+            kernel_cache={},
+        )
+
+
+def test_kernel_cache_defaults_to_64_entries():
+    assert DysolveKernelCache().maximum_entries == 64
+
+
+@pytest.mark.parametrize("invalid_limit", [-1, 1.5, True])
+def test_kernel_cache_size_must_be_non_negative_integer(invalid_limit):
+    with pytest.raises(ValueError, match="maximum_entries"):
+        DysolveKernelCache(maximum_entries=invalid_limit)
+
+
+def test_kernel_cache_can_clear_values_and_statistics_independently():
+    cache = DysolveKernelCache()
+    solver = DysolvePropagator(
+        0.31 * sigmaz(), 0.19 * sigmax(), 1.3, kernel_cache=cache
+    )
+    solver._compute_control_polynomial(0.015)
+
+    cache.clear_statistics()
+
+    assert cache.cache_info().current_entries == 1
+    assert cache.cache_info().hits == cache.cache_info().misses == 0
+
+    cache.clear()
+
+    assert cache.cache_info().current_entries == 0
 
 
 def test_timestep_tensor_cache_evicts_by_lru_and_recomputes():

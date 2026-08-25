@@ -3,6 +3,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from math import comb
 from numbers import Number
+from threading import Lock
 from typing import NamedTuple
 
 import numpy as np
@@ -15,6 +16,8 @@ from .cy.dysolve import cy_compute_Sn, cy_control_polynomial_vjp
 
 __all__ = [
     'DysolveEnvelopePropagation',
+    'DysolveKernelCache',
+    'DysolveKernelCacheInfo',
     'DysolvePropagator',
     'PreparedDysolveEnvelope',
     'dysolve_propagator',
@@ -73,6 +76,121 @@ class _DysolveControlPolynomial(NamedTuple):
     negative_counts: ArrayLike
     phase_charges: ArrayLike
     coefficients: ArrayLike
+
+
+class DysolveKernelCacheInfo(NamedTuple):
+    """Activity and capacity snapshot for a shared kernel cache."""
+
+    hits: int
+    misses: int
+    insertions: int
+    evictions: int
+    bypasses: int
+    current_entries: int
+    maximum_entries: int
+    current_bytes: int
+
+
+class DysolveKernelCache:
+    """Explicit LRU cache for immutable tensors shared by compatible solvers.
+
+    Create one cache and pass it to each solver or simulator that may share
+    Hamiltonians, drives, orders, and timesteps. No process-global or on-disk
+    state is used.
+    """
+
+    def __init__(self, maximum_entries: int = 64):
+        if type(maximum_entries) is not int or maximum_entries < 0:
+            raise ValueError("maximum_entries must be a non-negative integer")
+        self._maximum_entries = maximum_entries
+        self._entries = OrderedDict()
+        self._lock = Lock()
+        self._hits = 0
+        self._misses = 0
+        self._insertions = 0
+        self._evictions = 0
+        self._bypasses = 0
+
+    @property
+    def maximum_entries(self) -> int:
+        """Return the fixed entry capacity."""
+        return self._maximum_entries
+
+    def _get_polynomial(
+        self,
+        key: tuple,
+    ) -> _DysolveControlPolynomial | None:
+        """Return a shared collected polynomial when present."""
+        with self._lock:
+            if self.maximum_entries == 0:
+                self._bypasses += 1
+                return None
+            polynomial = self._entries.get(key)
+            if polynomial is None:
+                self._misses += 1
+                return None
+            self._hits += 1
+            self._entries.move_to_end(key)
+            return polynomial
+
+    def _store_polynomial(
+        self,
+        key: tuple,
+        polynomial: _DysolveControlPolynomial,
+    ) -> _DysolveControlPolynomial:
+        """Store and return the canonical immutable collected polynomial."""
+        if self.maximum_entries == 0:
+            return polynomial
+        immutable_arrays = []
+        for array in polynomial:
+            immutable_array = np.asarray(array)
+            immutable_array.setflags(write=False)
+            immutable_arrays.append(immutable_array)
+        immutable_polynomial = _DysolveControlPolynomial(*immutable_arrays)
+        with self._lock:
+            existing = self._entries.get(key)
+            if existing is not None:
+                self._entries.move_to_end(key)
+                return existing
+            self._entries[key] = immutable_polynomial
+            self._insertions += 1
+            while len(self._entries) > self.maximum_entries:
+                self._entries.popitem(last=False)
+                self._evictions += 1
+            return immutable_polynomial
+
+    def cache_info(self) -> DysolveKernelCacheInfo:
+        """Return cache activity, capacity, and retained tensor bytes."""
+        with self._lock:
+            current_bytes = sum(
+                array.nbytes
+                for polynomial in self._entries.values()
+                for array in polynomial
+            )
+            return DysolveKernelCacheInfo(
+                hits=self._hits,
+                misses=self._misses,
+                insertions=self._insertions,
+                evictions=self._evictions,
+                bypasses=self._bypasses,
+                current_entries=len(self._entries),
+                maximum_entries=self.maximum_entries,
+                current_bytes=current_bytes,
+            )
+
+    def clear(self) -> None:
+        """Discard all retained kernels without changing statistics."""
+        with self._lock:
+            self._entries.clear()
+
+    def clear_statistics(self) -> None:
+        """Reset activity counters without discarding retained kernels."""
+        with self._lock:
+            self._hits = 0
+            self._misses = 0
+            self._insertions = 0
+            self._evictions = 0
+            self._bypasses = 0
 
 
 class DysolveEnvelopePropagation(NamedTuple):
@@ -248,7 +366,12 @@ class DysolvePropagator:
         - "dt_cache_size"
 
             Maximum number of canonical time-step tensors retained by each
-            solver (default is 64). Zero disables this cache.
+            solver (default is 64). Zero disables this local cache. An explicit
+            ``kernel_cache`` owns retention instead when supplied.
+
+    kernel_cache : DysolveKernelCache, optional
+        Explicit process-local cache for immutable tensors shared by compatible
+        solver instances.
 
     Notes
     -----
@@ -273,8 +396,10 @@ class DysolvePropagator:
         X: Qobj,
         omega: float,
         options: dict[str] = None,
+        *,
+        kernel_cache: DysolveKernelCache | None = None,
     ):
-        self._initialize(H_0, [(X, omega)], options)
+        self._initialize(H_0, [(X, omega)], options, kernel_cache)
 
     @classmethod
     def from_drives(
@@ -282,6 +407,8 @@ class DysolvePropagator:
         H_0: Qobj,
         drives,
         options: dict[str] = None,
+        *,
+        kernel_cache: DysolveKernelCache | None = None,
     ):
         """Create a Dysolve propagator with multiple drive terms.
 
@@ -291,10 +418,16 @@ class DysolvePropagator:
         provide independent I/Q quadratures for each drive.
         """
         obj = cls.__new__(cls)
-        obj._initialize(H_0, drives, options)
+        obj._initialize(H_0, drives, options, kernel_cache)
         return obj
 
-    def _initialize(self, H_0: Qobj, drives, options: dict[str] = None):
+    def _initialize(
+        self,
+        H_0: Qobj,
+        drives,
+        options: dict[str] = None,
+        kernel_cache: DysolveKernelCache | None = None,
+    ):
         drives = tuple(drives)
         if len(drives) == 0:
             raise ValueError("at least one drive must be supplied")
@@ -342,6 +475,26 @@ class DysolvePropagator:
                 raise ValueError(f"{name} must be a positive integer")
         if type(self.dt_cache_size) is not int or self.dt_cache_size < 0:
             raise ValueError("dt_cache_size must be a non-negative integer")
+        if kernel_cache is not None and not isinstance(
+            kernel_cache, DysolveKernelCache
+        ):
+            raise TypeError("kernel_cache must be a DysolveKernelCache")
+        self._kernel_cache = kernel_cache
+        self._kernel_signature = (
+            (
+                self.max_order,
+                float(self.a_tol),
+                self._array_signature(self._eigenenergies),
+                self._array_signature(self._H_0.full()),
+                tuple(
+                    self._array_signature(drive.full())
+                    for drive in self._Xs
+                ),
+                self._array_signature(self._omegas),
+            )
+            if kernel_cache is not None
+            else None
+        )
 
         # Memoization
         self._dt_key_decimals = (
@@ -636,7 +789,12 @@ class DysolvePropagator:
         sum; it does not change its order, timestep, or counter-rotating terms.
         """
         dt_key = self.canonical_time_step(dt)
-        if dt_key in self._control_polynomials:
+        kernel_key = (self._kernel_signature, dt_key)
+        if self._kernel_cache is not None:
+            shared_polynomial = self._kernel_cache._get_polynomial(kernel_key)
+            if shared_polynomial is not None:
+                return shared_polynomial
+        elif dt_key in self._control_polynomials:
             self._dt_Sns.move_to_end(dt_key)
             return self._control_polynomials[dt_key]
 
@@ -687,6 +845,11 @@ class DysolvePropagator:
                 -1, length, length
             ),
         )
+        if self._kernel_cache is not None:
+            return self._kernel_cache._store_polynomial(
+                kernel_key,
+                polynomial,
+            )
         if self.dt_cache_size > 0:
             self._control_polynomials[dt_key] = polynomial
         return polynomial
@@ -756,6 +919,12 @@ class DysolvePropagator:
 
         self._matrix_element_paths[drive_indices] = (paths, path_values)
         return paths, path_values
+
+    @staticmethod
+    def _array_signature(array: ArrayLike) -> tuple:
+        """Return an exact, hashable signature for one solver tensor."""
+        contiguous = np.ascontiguousarray(array)
+        return contiguous.shape, contiguous.dtype.str, contiguous.tobytes()
 
     def canonical_time_step(self, dt: float) -> float:
         """Return the time step used for preparation and solver caches.
@@ -827,7 +996,7 @@ class DysolvePropagator:
 
             Sns[n] = Sn
 
-        if self.dt_cache_size > 0:
+        if self._kernel_cache is None and self.dt_cache_size > 0:
             self._dt_Sns[dt_key] = Sns
             while len(self._dt_Sns) > self.dt_cache_size:
                 evicted_dt, _ = self._dt_Sns.popitem(last=False)

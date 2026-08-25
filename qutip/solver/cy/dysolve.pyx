@@ -30,9 +30,9 @@ cdef inline double complex _integer_power(
 
 
 cdef inline double complex _control_monomial_derivative(
-    double complex[:, :] rotated_amplitudes,
-    int64_t[:, :] positive_counts,
-    int64_t[:, :] negative_counts,
+    const double complex[:, :] rotated_amplitudes,
+    const int64_t[:, :] positive_counts,
+    const int64_t[:, :] negative_counts,
     Py_ssize_t step,
     Py_ssize_t monomial,
     Py_ssize_t target_drive,
@@ -71,8 +71,8 @@ cdef inline double complex _control_monomial_derivative(
 
 
 cdef void _matrix_multiply(
-    double complex[:, :] left,
-    double complex[:, :] right,
+    const double complex[:, :] left,
+    const double complex[:, :] right,
     double complex[:, :] output,
 ) noexcept nogil:
     """Multiply two small dense matrices."""
@@ -174,15 +174,15 @@ cpdef object cy_compute_Sn(
 
 
 cpdef tuple cy_control_polynomial_vjp(
-    double complex[:, :] rotated_amplitudes,
-    double complex[:, :] rotations,
-    int64_t[:, :] positive_counts,
-    int64_t[:, :] negative_counts,
-    double complex[:, :, :] coefficients,
-    double complex[:, :] free_propagator,
-    double complex[:, :] cotangent,
-    double complex[:, :] boundary_prefix,
-    double complex[:, :] running_suffix,
+    const double complex[:, :] rotated_amplitudes,
+    const double complex[:, :] rotations,
+    const int64_t[:, :] positive_counts,
+    const int64_t[:, :] negative_counts,
+    const double complex[:, :, :] coefficients,
+    const double complex[:, :] free_propagator,
+    const double complex[:, :] cotangent,
+    const double complex[:, :] boundary_prefix,
+    const double complex[:, :] running_suffix,
 ):
     """Evaluate one polynomial batch and run its exact chronological VJP.
 
