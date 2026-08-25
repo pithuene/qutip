@@ -1,5 +1,6 @@
 import itertools
 from collections import OrderedDict
+from collections.abc import Callable
 from math import comb
 from numbers import Number
 from typing import NamedTuple
@@ -12,7 +13,13 @@ from qutip import Qobj, qeye_like
 
 from .cy.dysolve import cy_compute_Sn
 
-__all__ = ['DysolvePropagator', 'PreparedDysolveEnvelope', 'dysolve_propagator', 'gaussian_filter_matrix']
+__all__ = [
+    'DysolveEnvelopePropagation',
+    'DysolvePropagator',
+    'PreparedDysolveEnvelope',
+    'dysolve_propagator',
+    'gaussian_filter_matrix',
+]
 
 
 def gaussian_filter_matrix(
@@ -66,6 +73,19 @@ class _DysolveControlPolynomial(NamedTuple):
     negative_counts: ArrayLike
     phase_charges: ArrayLike
     coefficients: ArrayLike
+
+
+class DysolveEnvelopePropagation(NamedTuple):
+    """Bounded forward envelope data retained for one exact reverse pass."""
+
+    solver: 'DysolvePropagator'
+    propagator: Qobj
+    boundary_prefixes: tuple[ArrayLike, ...]
+    step_count: int
+    batch_size: int
+    dt: float
+    t0: float
+    carrier_phases: tuple[float, ...]
 
 
 class PreparedDysolveEnvelope:
@@ -150,6 +170,26 @@ class PreparedDysolveEnvelope:
             )
         return Qobj(total, self._solver._H_0._dims, copy=False).transform(
             self._solver._basis, True
+        )
+
+    def propagation(
+        self,
+        t0: float = 0.0,
+        carrier_phases: ArrayLike | None = None,
+    ) -> DysolveEnvelopePropagation:
+        """Propagate and retain the forward data required by reverse mode."""
+        phases = self._solver._as_carrier_phases(carrier_phases)
+        return self._solver._retain_envelope_propagation(
+            self.n_subpixels,
+            lambda start, stop: self._subpropagators_slice(
+                start,
+                stop,
+                t0,
+                phases,
+            ),
+            self.dt,
+            t0,
+            phases,
         )
 
 
@@ -508,6 +548,38 @@ class DysolvePropagator:
             product_derivatives = reduced_derivatives
         return product[0], product_derivatives[:, 0]
 
+    def _retain_envelope_propagation(
+        self,
+        step_count: int,
+        subpropagator_slice: Callable[[int, int], ArrayLike],
+        dt: float,
+        t0: float,
+        carrier_phases: ArrayLike,
+    ) -> DysolveEnvelopePropagation:
+        """Propagate in bounded batches and retain their boundary prefixes."""
+        length = len(self._eigenenergies)
+        boundary_prefixes = [np.eye(length, dtype=np.complex128)]
+        batch_size = self._fixed_order_batch_size(1)
+        for start in range(0, step_count, batch_size):
+            stop = min(start + batch_size, step_count)
+            batch_product, _ = self._chronological_product(
+                subpropagator_slice(start, stop)
+            )
+            boundary_prefixes.append(batch_product @ boundary_prefixes[-1])
+        propagator = Qobj(
+            boundary_prefixes[-1], self._H_0._dims, copy=False
+        ).transform(self._basis, True)
+        return DysolveEnvelopePropagation(
+            solver=self,
+            propagator=propagator,
+            boundary_prefixes=tuple(boundary_prefixes),
+            step_count=step_count,
+            batch_size=batch_size,
+            dt=self.canonical_time_step(dt),
+            t0=float(t0),
+            carrier_phases=tuple(float(phase) for phase in carrier_phases),
+        )
+
     def _get_branch_metadata(self, n: int) -> tuple[ArrayLike, ArrayLike, ArrayLike]:
         """
         Get drive indices, signs and frequencies for a Dyson order.
@@ -832,11 +904,11 @@ class DysolvePropagator:
         if not gradient:
             return subpropagators
 
-        dsubprops_dx = np.empty(
+        derivatives_x = np.empty(
             (self._n_drives, len(current_times), length, length),
             dtype=np.complex128,
         )
-        dsubprops_dy = np.empty_like(dsubprops_dx)
+        derivatives_y = np.empty_like(derivatives_x)
         for drive_index in range(self._n_drives):
             product_except_drive = np.ones_like(control_values)
             for other_drive_index, factor in enumerate(drive_factors):
@@ -867,17 +939,17 @@ class DysolvePropagator:
                 negative_derivative * rotation
                 - positive_derivative * np.conj(rotation)
             )
-            dsubprops_dx[drive_index] = np.tensordot(
+            derivatives_x[drive_index] = np.tensordot(
                 derivative_x,
                 polynomial.coefficients,
                 axes=(1, 0),
             )
-            dsubprops_dy[drive_index] = np.tensordot(
+            derivatives_y[drive_index] = np.tensordot(
                 derivative_y,
                 polynomial.coefficients,
                 axes=(1, 0),
             )
-        return subpropagators, dsubprops_dx, dsubprops_dy
+        return subpropagators, derivatives_x, derivatives_y
 
     def _compute_envelope_subprops(
         self,
@@ -923,13 +995,16 @@ class DysolvePropagator:
         t0: float = 0.0,
         *,
         carrier_phases: ArrayLike | None = None,
+        forward_propagation: DysolveEnvelopePropagation | None = None,
     ) -> tuple[Qobj, ArrayLike, ArrayLike]:
         """Return a propagator and its reverse-mode envelope gradients.
 
         The cotangent follows the real scalar convention
         ``dF = real(trace(cotangent.dag() * dU))``. The returned complex
         envelope cotangent satisfies ``dF = real(vdot(cotangent, dA))``.
-        Carrier-phase gradients contain one real value per drive.
+        Carrier-phase gradients contain one real value per drive. A
+        ``forward_propagation`` returned for the same amplitudes skips the
+        otherwise redundant forward reconstruction.
         """
         amplitudes = self._as_drive_amplitudes(amplitudes)
         phases = self._as_carrier_phases(carrier_phases)
@@ -937,19 +1012,38 @@ class DysolvePropagator:
         effective_amplitudes = amplitudes * carrier_factors
         length = len(self._eigenenergies)
         step_count = effective_amplitudes.shape[1]
-        batch_size = self._fixed_order_batch_size(1)
+        batch_size = (
+            self._fixed_order_batch_size(1)
+            if forward_propagation is None
+            else forward_propagation.batch_size
+        )
         batch_starts = tuple(range(0, step_count, batch_size))
 
-        boundary_prefixes = [np.eye(length, dtype=np.complex128)]
-        for start in batch_starts:
-            stop = min(start + batch_size, step_count)
-            subpropagators = self._compute_envelope_subprops(
-                effective_amplitudes[:, start:stop],
-                dt,
-                t0 + start * dt,
-            )
-            batch_product, _ = self._chronological_product(subpropagators)
-            boundary_prefixes.append(batch_product @ boundary_prefixes[-1])
+        if forward_propagation is None:
+            boundary_prefixes = [np.eye(length, dtype=np.complex128)]
+            for start in batch_starts:
+                stop = min(start + batch_size, step_count)
+                subpropagators = self._compute_envelope_subprops(
+                    effective_amplitudes[:, start:stop],
+                    dt,
+                    t0 + start * dt,
+                )
+                batch_product, _ = self._chronological_product(subpropagators)
+                boundary_prefixes.append(
+                    batch_product @ boundary_prefixes[-1]
+                )
+        else:
+            if forward_propagation.solver is not self:
+                raise ValueError("forward_propagation belongs to another solver")
+            if forward_propagation.dt != self.canonical_time_step(dt):
+                raise ValueError("forward_propagation uses another timestep")
+            if forward_propagation.t0 != float(t0):
+                raise ValueError("forward_propagation uses another start time")
+            if not np.array_equal(forward_propagation.carrier_phases, phases):
+                raise ValueError("forward_propagation uses other carrier phases")
+            if forward_propagation.step_count != step_count:
+                raise ValueError("forward_propagation uses another envelope length")
+            boundary_prefixes = forward_propagation.boundary_prefixes
 
         cotangent = propagator_cotangent.transform(self._basis).full()
         effective_cotangent = np.empty_like(effective_amplitudes, dtype=np.complex128)
@@ -987,7 +1081,13 @@ class DysolvePropagator:
         amplitude_cotangent = effective_cotangent * carrier_factors.conj()
         carrier_phase_gradients = np.real(np.sum(np.conj(effective_cotangent) * (-1j * effective_amplitudes), axis=1))
 
-        propagator = Qobj(boundary_prefixes[-1], self._H_0._dims, copy=False).transform(self._basis, True)
+        propagator = (
+            Qobj(boundary_prefixes[-1], self._H_0._dims, copy=False).transform(
+                self._basis, True
+            )
+            if forward_propagation is None
+            else forward_propagation.propagator
+        )
         return propagator, amplitude_cotangent, carrier_phase_gradients
 
     def envelope_parameter_gradients(
@@ -1083,6 +1183,30 @@ class DysolvePropagator:
             for gradient in parameter_gradients
         )
         return U, dU_dp
+
+    def envelope_propagation(
+        self,
+        amplitudes: ArrayLike,
+        dt: float,
+        t0: float = 0.0,
+        *,
+        carrier_phases: ArrayLike | None = None,
+    ) -> DysolveEnvelopePropagation:
+        """Propagate and retain the forward data required by reverse mode."""
+        amplitudes = self._as_drive_amplitudes(amplitudes)
+        phases = self._as_carrier_phases(carrier_phases)
+        effective_amplitudes = amplitudes * np.exp(-1j * phases)[:, None]
+        return self._retain_envelope_propagation(
+            effective_amplitudes.shape[1],
+            lambda start, stop: self._compute_envelope_subprops(
+                effective_amplitudes[:, start:stop],
+                dt,
+                t0 + start * dt,
+            ),
+            dt,
+            t0,
+            phases,
+        )
 
     def envelope_propagator(
         self,

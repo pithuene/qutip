@@ -510,6 +510,83 @@ def test_envelope_parameter_gradients_match_finite_difference():
         np.testing.assert_allclose(_qobj_data(parameter_gradient), finite_difference, rtol=1e-8, atol=1e-8)
 
 
+def test_retained_propagation_skips_forward_reconstruction(monkeypatch):
+    dt = 0.015
+    t0 = 0.07
+    amplitudes = np.array(
+        [[0.7 + 0.1j, -0.2 + 0.3j], [0.4 - 0.2j, 0.1 + 0.5j]]
+    )
+    carrier_phases = np.array([0.2, -0.3])
+    solver = DysolvePropagator.from_drives(
+        0.31 * sigmaz(),
+        [(0.19 * sigmax(), 1.3), (0.13 * sigmay(), 1.9)],
+        options={"max_order": 3, "fixed_order_batch_size": 1},
+    )
+    cotangent = 0.4 * qeye(2) + (0.2 + 0.1j) * sigmax() - 0.3j * sigmay()
+    expected = solver.envelope_propagator_vjp(
+        amplitudes,
+        cotangent,
+        dt,
+        t0=t0,
+        carrier_phases=carrier_phases,
+    )
+    forward = solver.prepare_envelope(amplitudes, dt).propagation(
+        t0=t0,
+        carrier_phases=carrier_phases,
+    )
+
+    assert not hasattr(forward, "subpropagators")
+    assert len(forward.boundary_prefixes) == 3
+    original_subpropagators = solver._compute_envelope_subprops
+
+    def require_reverse_derivatives(*args, **kwargs):
+        assert kwargs.get("gradient"), (
+            "retained propagation must skip forward-only reconstruction"
+        )
+        return original_subpropagators(*args, **kwargs)
+
+    monkeypatch.setattr(
+        solver,
+        "_compute_envelope_subprops",
+        require_reverse_derivatives,
+    )
+    actual = solver.envelope_propagator_vjp(
+        amplitudes,
+        cotangent,
+        dt,
+        t0=t0,
+        carrier_phases=carrier_phases,
+        forward_propagation=forward,
+    )
+
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        if isinstance(actual_value, Qobj):
+            np.testing.assert_allclose(
+                actual_value.full(), expected_value.full(), atol=1e-12
+            )
+        else:
+            np.testing.assert_allclose(actual_value, expected_value, atol=1e-12)
+
+
+def test_retained_propagation_rejects_another_solver():
+    amplitudes = np.array([0.7 + 0.1j, -0.2 + 0.3j])
+    first_solver = DysolvePropagator(
+        0.31 * sigmaz(), 0.19 * sigmax(), 1.3, options={"max_order": 2}
+    )
+    second_solver = DysolvePropagator(
+        0.31 * sigmaz(), 0.19 * sigmax(), 1.3, options={"max_order": 2}
+    )
+    forward = first_solver.envelope_propagation(amplitudes, 0.015)
+
+    with pytest.raises(ValueError, match="another solver"):
+        second_solver.envelope_propagator_vjp(
+            amplitudes,
+            qeye(2),
+            0.015,
+            forward_propagation=forward,
+        )
+
+
 def test_envelope_propagator_vjp_matches_forward_parameter_gradients():
     dt = 0.015
     t0 = 0.07
