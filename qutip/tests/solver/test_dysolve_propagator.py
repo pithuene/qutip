@@ -87,16 +87,12 @@ def test_prepared_envelope_nbytes_matches_owned_arrays():
     )
 
     prepared = solver.prepare_envelope(amplitudes, 0.02)
-    owned_array_nbytes = sum(
-        phase_charges.nbytes + branch_weights.nbytes
-        for _, phase_charges, branch_weights, _ in prepared._terms
-    )
 
-    assert prepared.nbytes == owned_array_nbytes
+    assert prepared.nbytes == prepared._control_values.nbytes
     assert prepared.nbytes == solver.estimate_prepared_envelope_nbytes(len(amplitudes))
 
 
-def test_prepared_envelope_stores_scalar_branch_weights():
+def test_prepared_envelope_stores_control_monomials():
     amplitudes = np.array(
         [[0.7 + 0.1j, -0.2 + 0.3j], [0.4 - 0.2j, 0.1 + 0.5j]]
     )
@@ -107,11 +103,112 @@ def test_prepared_envelope_stores_scalar_branch_weights():
     )
 
     prepared = solver.prepare_envelope(amplitudes, 0.02)
+    polynomial = prepared._polynomial
 
-    for omega_sums, phase_charges, branch_weights, Sn in prepared._terms:
-        assert branch_weights.shape == (amplitudes.shape[1], len(omega_sums))
-        assert phase_charges.shape == (len(omega_sums), amplitudes.shape[0])
-        assert Sn.shape[0] == len(omega_sums)
+    assert polynomial.coefficients.shape == (14, 2, 2)
+    assert polynomial.positive_counts.shape == (14, amplitudes.shape[0])
+    assert polynomial.negative_counts.shape == (14, amplitudes.shape[0])
+    assert prepared._control_values.shape == (amplitudes.shape[1], 14)
+
+
+def test_control_polynomial_matches_explicit_ordered_branch_sum():
+    dt = 0.015
+    current_times = np.array([0.07, 0.11, 0.19])
+    amplitudes = np.array(
+        [
+            [0.7 + 0.1j, -0.2 + 0.3j, 0.4 - 0.2j],
+            [0.2 - 0.4j, 0.6 + 0.2j, -0.1 + 0.3j],
+        ]
+    )
+    solver = DysolvePropagator.from_drives(
+        0.31 * sigmaz(),
+        [(0.19 * sigmax(), 1.3), (0.13 * sigmay(), 1.9)],
+        options={"max_order": 4},
+    )
+    Sns = solver._compute_Sns(dt)
+    expected = np.broadcast_to(Sns[0], (len(current_times), 2, 2)).astype(
+        np.complex128, copy=True
+    )
+    for order in range(1, solver.max_order + 1):
+        drive_indices, signs, omega_vectors = solver._get_branch_metadata(order)
+        branch_values = np.ones(
+            (len(current_times), len(drive_indices)), dtype=np.complex128
+        )
+        for position in range(order):
+            for drive_index in range(solver._n_drives):
+                drive_mask = drive_indices[:, position] == drive_index
+                positive = drive_mask & (signs[:, position] > 0)
+                negative = drive_mask & (signs[:, position] < 0)
+                branch_values[:, positive] *= np.conj(amplitudes[drive_index])[:, None]
+                branch_values[:, negative] *= amplitudes[drive_index, :, None]
+        branch_phases = np.exp(
+            1j * np.outer(current_times, np.sum(omega_vectors, axis=1))
+        )
+        expected += np.tensordot(
+            branch_phases * branch_values,
+            Sns[order],
+            axes=(1, 0),
+        )
+
+    actual = solver._compute_control_subprops(amplitudes, current_times, dt)
+    polynomial = solver._compute_control_polynomial(dt)
+
+    assert len(polynomial.coefficients) == 69
+    np.testing.assert_allclose(actual, expected, rtol=1e-13, atol=1e-13)
+
+
+def test_control_polynomial_gradients_are_finite_at_zero_amplitude():
+    dt = 0.015
+    current_times = np.array([0.07])
+    amplitudes = np.zeros((2, 1), dtype=np.complex128)
+    solver = DysolvePropagator.from_drives(
+        0.31 * sigmaz(),
+        [(0.19 * sigmax(), 1.3), (0.13 * sigmay(), 1.9)],
+        options={"max_order": 4},
+    )
+
+    _, derivatives_x, derivatives_y = solver._compute_control_subprops(
+        amplitudes,
+        current_times,
+        dt,
+        gradient=True,
+    )
+
+    assert np.all(np.isfinite(derivatives_x))
+    assert np.all(np.isfinite(derivatives_y))
+    epsilon = 1e-7
+    for drive_index in range(2):
+        real_direction = np.zeros_like(amplitudes)
+        real_direction[drive_index, 0] = epsilon
+        finite_difference_x = (
+            solver._compute_control_subprops(
+                amplitudes + real_direction, current_times, dt
+            )
+            - solver._compute_control_subprops(
+                amplitudes - real_direction, current_times, dt
+            )
+        ) / (2 * epsilon)
+        imaginary_direction = 1j * real_direction
+        finite_difference_y = (
+            solver._compute_control_subprops(
+                amplitudes + imaginary_direction, current_times, dt
+            )
+            - solver._compute_control_subprops(
+                amplitudes - imaginary_direction, current_times, dt
+            )
+        ) / (2 * epsilon)
+        np.testing.assert_allclose(
+            derivatives_x[drive_index, 0],
+            finite_difference_x[0],
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            derivatives_y[drive_index, 0],
+            finite_difference_y[0],
+            rtol=1e-10,
+            atol=1e-10,
+        )
 
 
 def test_timestep_tensor_cache_evicts_by_lru_and_recomputes():
@@ -135,6 +232,26 @@ def test_timestep_tensor_cache_evicts_by_lru_and_recomputes():
     for order in second:
         np.testing.assert_allclose(recomputed_second[order], second[order])
     assert len(solver._dt_Sns) <= 2
+
+
+def test_control_polynomial_cache_follows_timestep_tensor_lru():
+    solver = DysolvePropagator(
+        0.31 * sigmaz(),
+        0.19 * sigmax(),
+        1.3,
+        options={"max_order": 2, "dt_cache_size": 2},
+    )
+    first = solver._compute_control_polynomial(0.01)
+    second = solver._compute_control_polynomial(0.02)
+
+    assert solver._compute_control_polynomial(0.01) is first
+    solver._compute_control_polynomial(0.03)
+
+    assert tuple(solver._dt_Sns) == (0.01, 0.03)
+    assert set(solver._control_polynomials) == {0.01, 0.03}
+    assert solver._compute_control_polynomial(0.02) is not second
+    assert tuple(solver._dt_Sns) == (0.03, 0.02)
+    assert set(solver._control_polynomials) == {0.02, 0.03}
 
 
 def test_zero_timestep_tensor_cache_size_bypasses_storage():

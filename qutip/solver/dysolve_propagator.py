@@ -1,6 +1,8 @@
 import itertools
 from collections import OrderedDict
+from math import comb
 from numbers import Number
+from typing import NamedTuple
 
 import numpy as np
 from numpy.typing import ArrayLike
@@ -56,12 +58,22 @@ def gaussian_filter_matrix(
     return matrix
 
 
+class _DysolveControlPolynomial(NamedTuple):
+    """Static Dyson matrices collected by equal control monomial."""
+
+    free_propagator: ArrayLike
+    positive_counts: ArrayLike
+    negative_counts: ArrayLike
+    phase_charges: ArrayLike
+    coefficients: ArrayLike
+
+
 class PreparedDysolveEnvelope:
-    """Prepared t0-independent branch weights for a fixed envelope.
+    """Prepared t0-independent control monomials for a fixed envelope.
 
     Envelope and local-time factors are prepared once. Absolute start time and
     carrier phases remain runtime inputs, so identical pulses can be reused at
-    different placements without storing per-phase-group matrices.
+    different placements without storing subpropagator matrices.
     """
 
     def __init__(self, solver, amplitudes: ArrayLike, dt: float):
@@ -75,38 +87,19 @@ class PreparedDysolveEnvelope:
         )
         self.n_subpixels = int(amplitudes.shape[1])
         self._length = len(solver._eigenenergies)
-        self._S0 = solver._compute_Sns(self.dt)[0]
-        self._terms = self._prepare_terms(amplitudes)
+        self._polynomial = solver._compute_control_polynomial(self.dt)
+        local_times = np.arange(self.n_subpixels, dtype=float) * self.dt
+        rotations = np.exp(-1j * np.outer(solver._omegas, local_times))
+        drive_factors = solver._control_monomial_factors(
+            amplitudes * rotations,
+            self._polynomial,
+        )
+        self._control_values = np.prod(drive_factors, axis=0)
 
     @property
     def nbytes(self) -> int:
         """Return bytes in arrays owned only by this prepared envelope."""
-        return sum(
-            phase_charges.nbytes + branch_weights.nbytes
-            for _, phase_charges, branch_weights, _ in self._terms
-        )
-
-    def _prepare_terms(self, amplitudes: ArrayLike):
-        solver = self._solver
-        local_times = np.arange(self.n_subpixels, dtype=float) * self.dt
-        Sns = solver._compute_Sns(self.dt)
-        terms = []
-        for n in range(1, solver.max_order + 1):
-            omega_sums = solver._get_omega_sums(n)
-            amplitude_factors = solver._envelope_branch_factors(amplitudes, n)
-            branch_weights = (
-                np.exp(1j * np.outer(local_times, omega_sums)) * amplitude_factors
-            )
-            drive_indices, signs, _ = solver._get_branch_metadata(n)
-            phase_charges = np.zeros(
-                (len(drive_indices), solver._n_drives), dtype=np.int_
-            )
-            for drive_index in range(solver._n_drives):
-                phase_charges[:, drive_index] = np.sum(
-                    signs * (drive_indices == drive_index), axis=1
-                )
-            terms.append((omega_sums, phase_charges, branch_weights, Sns[n]))
-        return tuple(terms)
+        return self._control_values.nbytes
 
     def _subpropagators_slice(
         self,
@@ -116,18 +109,18 @@ class PreparedDysolveEnvelope:
         carrier_phases: ArrayLike,
     ) -> ArrayLike:
         """Materialize one chronological slice of prepared subpropagators."""
+        polynomial = self._polynomial
         subpropagators = np.broadcast_to(
-            self._S0, (stop - start, self._length, self._length)
+            polynomial.free_propagator,
+            (stop - start, self._length, self._length),
         ).astype(np.complex128, copy=True)
-        for omega_sums, phase_charges, branch_weights, Sn in self._terms:
-            branch_phases = np.exp(
-                1j * (omega_sums * float(t0) + phase_charges @ carrier_phases)
-            )
-            subpropagators += np.tensordot(
-                branch_weights[start:stop] * branch_phases,
-                Sn,
-                axes=(1, 0),
-            )
+        effective_phases = self._solver._omegas * float(t0) + carrier_phases
+        monomial_phases = np.exp(1j * (polynomial.phase_charges @ effective_phases))
+        subpropagators += np.tensordot(
+            self._control_values[start:stop] * monomial_phases,
+            polynomial.coefficients,
+            axes=(1, 0),
+        )
         return subpropagators
 
     def subpropagators(
@@ -315,8 +308,8 @@ class DysolvePropagator:
             options.get('dt_key_decimals', 15) if options is not None else 15
         )
         self._dt_Sns = OrderedDict()
+        self._control_polynomials = {}
         self._omega_vectors = {}
-        self._omega_sums = {}
         self._branch_drive_indices = {}
         self._branch_signs = {}
         self._matrix_element_paths = {}
@@ -554,15 +547,93 @@ class DysolvePropagator:
         """
         return self._get_branch_metadata(n)[2]
 
-    def _get_omega_sums(self, n: int) -> ArrayLike:
+    def _compute_control_polynomial(self, dt: float) -> _DysolveControlPolynomial:
+        r"""Collect ordered Dyson branches with equal control dependence.
+
+        Equation (B2) of the Dysolve paper weights every ordered branch by a
+        product of complex drive amplitudes. For a piecewise-constant subpixel,
+        that product depends only on how often each positive- and
+        negative-frequency drive branch occurs, not on their order. If
+        ``z_d = a_d exp(-i omega_d t)``, all branches with counts ``p_d`` and
+        ``q_d`` share the monomial
+
+        ``prod_d conj(z_d)**p_d * z_d**q_d``.
+
+        Their ordered operator integrals remain distinct and are summed into
+        one static matrix coefficient. This only reassociates the finite Dyson
+        sum; it does not change its order, timestep, or counter-rotating terms.
         """
-        Get sums of all drive-frequency sign combinations for a Dyson order.
-        """
-        if n not in self._omega_sums:
-            self._omega_sums[n] = np.ascontiguousarray(
-                np.sum(self._get_omega_vectors(n), axis=1), dtype=float
+        dt_key = self.canonical_time_step(dt)
+        if dt_key in self._control_polynomials:
+            self._dt_Sns.move_to_end(dt_key)
+            return self._control_polynomials[dt_key]
+
+        Sns = self._compute_Sns(dt_key)
+        positive_counts = []
+        negative_counts = []
+        coefficients = []
+        for order in range(1, self.max_order + 1):
+            drive_indices, signs, _ = self._get_branch_metadata(order)
+            branch_positive_counts = np.zeros(
+                (len(drive_indices), self._n_drives), dtype=np.int_
             )
-        return self._omega_sums[n]
+            branch_negative_counts = np.zeros_like(branch_positive_counts)
+            for drive_index in range(self._n_drives):
+                drive_mask = drive_indices == drive_index
+                branch_positive_counts[:, drive_index] = np.sum(
+                    drive_mask & (signs > 0), axis=1
+                )
+                branch_negative_counts[:, drive_index] = np.sum(
+                    drive_mask & (signs < 0), axis=1
+                )
+            branch_counts = np.column_stack(
+                (branch_positive_counts, branch_negative_counts)
+            )
+            unique_counts, inverse = np.unique(
+                branch_counts, axis=0, return_inverse=True
+            )
+            for group_index, counts in enumerate(unique_counts):
+                positive_counts.append(counts[:self._n_drives])
+                negative_counts.append(counts[self._n_drives:])
+                coefficients.append(
+                    np.sum(Sns[order][inverse == group_index], axis=0)
+                )
+
+        length = len(self._eigenenergies)
+        positive_counts = np.asarray(positive_counts, dtype=np.int_).reshape(
+            -1, self._n_drives
+        )
+        negative_counts = np.asarray(negative_counts, dtype=np.int_).reshape(
+            -1, self._n_drives
+        )
+        polynomial = _DysolveControlPolynomial(
+            free_propagator=Sns[0],
+            positive_counts=positive_counts,
+            negative_counts=negative_counts,
+            phase_charges=positive_counts - negative_counts,
+            coefficients=np.asarray(coefficients, dtype=np.complex128).reshape(
+                -1, length, length
+            ),
+        )
+        if self.dt_cache_size > 0:
+            self._control_polynomials[dt_key] = polynomial
+        return polynomial
+
+    @staticmethod
+    def _control_monomial_factors(
+        rotated_amplitudes: ArrayLike,
+        polynomial: _DysolveControlPolynomial,
+    ) -> ArrayLike:
+        """Return one control-monomial factor array per drive."""
+        return np.asarray(
+            [
+                np.conj(rotated_amplitudes[drive_index])[:, None]
+                ** polynomial.positive_counts[None, :, drive_index]
+                * rotated_amplitudes[drive_index, :, None]
+                ** polynomial.negative_counts[None, :, drive_index]
+                for drive_index in range(rotated_amplitudes.shape[0])
+            ]
+        )
 
     def _get_matrix_element_paths(
         self, drive_indices: tuple[int, ...]
@@ -687,7 +758,8 @@ class DysolvePropagator:
         if self.dt_cache_size > 0:
             self._dt_Sns[dt_key] = Sns
             while len(self._dt_Sns) > self.dt_cache_size:
-                self._dt_Sns.popitem(last=False)
+                evicted_dt, _ = self._dt_Sns.popitem(last=False)
+                self._control_polynomials.pop(evicted_dt, None)
         return Sns
 
     def _as_drive_amplitudes(self, amplitudes: ArrayLike) -> ArrayLike:
@@ -725,73 +797,87 @@ class DysolvePropagator:
             return tuple(gradients[0])
         return tuple(tuple(drive_gradients) for drive_gradients in gradients)
 
-    def _envelope_branch_factors(
+    def _compute_control_subprops(
         self,
         amplitudes: ArrayLike,
-        n: int,
+        current_times: ArrayLike,
+        dt: float,
         *,
         gradient: bool | str = False,
     ) -> ArrayLike | tuple[ArrayLike, ArrayLike, ArrayLike]:
-        """
-        Return branch amplitude factors for a piecewise-constant envelope.
+        """Evaluate the collected control polynomial at each requested time."""
+        amplitudes = self._as_drive_amplitudes(amplitudes)
+        current_times = np.asarray(current_times, dtype=float)
+        if amplitudes.shape[1] != len(current_times):
+            raise ValueError("amplitudes and current_times must have equal lengths")
 
-        ``amplitudes`` has shape ``(n_drives, n_subpixels)``.  A complex
-        amplitude ``a = x + 1j*y`` represents the real drive
-        ``x*cos(omega*t) + y*sin(omega*t)`` multiplying that drive's operator.
-        Since the prepared Dyson tensors already include the ``1/2`` factors
-        from the cosine decomposition, each positive-frequency branch is
-        weighted by ``conj(a)`` and each negative-frequency branch by ``a``.
-        """
-        amplitudes = np.asarray(amplitudes)
-        drive_indices, signs, _ = self._get_branch_metadata(n)
-        n_subpixels = amplitudes.shape[1]
-        n_branches = drive_indices.shape[0]
-
-        factors = np.ones((n_subpixels, n_branches), dtype=np.result_type(amplitudes, complex))
-        values_by_position = []
-        for position in range(n):
-            values = np.empty_like(factors)
-            for drive_index in range(self._n_drives):
-                drive_mask = drive_indices[:, position] == drive_index
-                if not np.any(drive_mask):
-                    continue
-                positive = drive_mask & (signs[:, position] > 0)
-                negative = drive_mask & (signs[:, position] < 0)
-                if np.any(positive):
-                    values[:, positive] = np.conjugate(amplitudes[drive_index])[:, None]
-                if np.any(negative):
-                    values[:, negative] = amplitudes[drive_index, :, None]
-            values_by_position.append(values)
-            factors *= values
-
-        if not gradient:
-            return factors
-
-        d_dx = np.zeros(
-            (self._n_drives, n_subpixels, n_branches),
-            dtype=np.result_type(amplitudes, complex),
+        polynomial = self._compute_control_polynomial(dt)
+        rotations = np.exp(-1j * np.outer(self._omegas, current_times))
+        rotated_amplitudes = amplitudes * rotations
+        drive_factors = self._control_monomial_factors(
+            rotated_amplitudes,
+            polynomial,
         )
-        d_dy = np.zeros_like(d_dx)
-        for position in range(n):
-            product_except = np.ones_like(factors)
-            for other_position, values in enumerate(values_by_position):
-                if other_position != position:
-                    product_except *= values
-            for drive_index in range(self._n_drives):
-                drive_mask = drive_indices[:, position] == drive_index
-                if not np.any(drive_mask):
-                    continue
-                positive = drive_mask & (signs[:, position] > 0)
-                negative = drive_mask & (signs[:, position] < 0)
-                if np.any(positive):
-                    branch_indices = np.nonzero(positive)[0]
-                    d_dx[drive_index][:, branch_indices] += product_except[:, branch_indices]
-                    d_dy[drive_index][:, branch_indices] += -1j * product_except[:, branch_indices]
-                if np.any(negative):
-                    branch_indices = np.nonzero(negative)[0]
-                    d_dx[drive_index][:, branch_indices] += product_except[:, branch_indices]
-                    d_dy[drive_index][:, branch_indices] += 1j * product_except[:, branch_indices]
-        return factors, d_dx, d_dy
+        control_values = np.prod(drive_factors, axis=0)
+        length = len(self._eigenenergies)
+        subpropagators = np.broadcast_to(
+            polynomial.free_propagator,
+            (len(current_times), length, length),
+        ).astype(np.complex128, copy=True)
+        subpropagators += np.tensordot(
+            control_values,
+            polynomial.coefficients,
+            axes=(1, 0),
+        )
+        if not gradient:
+            return subpropagators
+
+        dsubprops_dx = np.empty(
+            (self._n_drives, len(current_times), length, length),
+            dtype=np.complex128,
+        )
+        dsubprops_dy = np.empty_like(dsubprops_dx)
+        for drive_index in range(self._n_drives):
+            product_except_drive = np.ones_like(control_values)
+            for other_drive_index, factor in enumerate(drive_factors):
+                if other_drive_index != drive_index:
+                    product_except_drive *= factor
+
+            rotated_amplitude = rotated_amplitudes[drive_index, :, None]
+            rotation = rotations[drive_index, :, None]
+            positive_counts = polynomial.positive_counts[None, :, drive_index]
+            negative_counts = polynomial.negative_counts[None, :, drive_index]
+            positive_derivative = (
+                positive_counts
+                * np.conj(rotated_amplitude)
+                ** np.maximum(positive_counts - 1, 0)
+                * rotated_amplitude**negative_counts
+            )
+            negative_derivative = (
+                negative_counts
+                * np.conj(rotated_amplitude)**positive_counts
+                * rotated_amplitude
+                ** np.maximum(negative_counts - 1, 0)
+            )
+            derivative_x = product_except_drive * (
+                positive_derivative * np.conj(rotation)
+                + negative_derivative * rotation
+            )
+            derivative_y = 1j * product_except_drive * (
+                negative_derivative * rotation
+                - positive_derivative * np.conj(rotation)
+            )
+            dsubprops_dx[drive_index] = np.tensordot(
+                derivative_x,
+                polynomial.coefficients,
+                axes=(1, 0),
+            )
+            dsubprops_dy[drive_index] = np.tensordot(
+                derivative_y,
+                polynomial.coefficients,
+                axes=(1, 0),
+            )
+        return subpropagators, dsubprops_dx, dsubprops_dy
 
     def _compute_envelope_subprops(
         self,
@@ -801,47 +887,15 @@ class DysolvePropagator:
         *,
         gradient: bool | str = False,
     ) -> ArrayLike | tuple[ArrayLike, ArrayLike, ArrayLike]:
-        """
-        Compute all subpixel propagators for a shaped envelope.
-        """
+        """Compute all subpixel propagators for a shaped envelope."""
         amplitudes = self._as_drive_amplitudes(amplitudes)
-        n_subpixels = amplitudes.shape[1]
-
-        current_times = t0 + np.arange(n_subpixels, dtype=float) * dt
-        Sns = self._compute_Sns(dt)
-        length = len(self._eigenenergies)
-        subpropagators = np.broadcast_to(
-            Sns[0], (n_subpixels, length, length)
-        ).astype(np.complex128, copy=True)
-        if gradient:
-            dsubprops_dx = np.zeros(
-                (self._n_drives, n_subpixels, length, length), dtype=np.complex128
-            )
-            dsubprops_dy = np.zeros_like(dsubprops_dx)
-
-        for n in range(1, self.max_order + 1):
-            omega_sums = self._get_omega_sums(n)
-            phases = np.exp(1j * np.outer(current_times, omega_sums))
-            if gradient:
-                amp_factors, d_amp_dx, d_amp_dy = self._envelope_branch_factors(
-                    amplitudes, n, gradient=True
-                )
-                for drive_index in range(self._n_drives):
-                    dsubprops_dx[drive_index] += np.tensordot(
-                        phases * d_amp_dx[drive_index], Sns[n], axes=(1, 0)
-                    )
-                    dsubprops_dy[drive_index] += np.tensordot(
-                        phases * d_amp_dy[drive_index], Sns[n], axes=(1, 0)
-                    )
-            else:
-                amp_factors = self._envelope_branch_factors(amplitudes, n)
-            subpropagators += np.tensordot(
-                phases * amp_factors, Sns[n], axes=(1, 0)
-            )
-
-        if gradient:
-            return subpropagators, dsubprops_dx, dsubprops_dy
-        return subpropagators
+        current_times = t0 + np.arange(amplitudes.shape[1], dtype=float) * dt
+        return self._compute_control_subprops(
+            amplitudes,
+            current_times,
+            dt,
+            gradient=gradient,
+        )
 
     def estimate_prepared_envelope_nbytes(self, n_subpixels: int) -> int:
         """Estimate arrays owned by a prepared complex128 envelope.
@@ -851,17 +905,14 @@ class DysolvePropagator:
         """
         if n_subpixels <= 0:
             raise ValueError("n_subpixels must be positive")
-        term_bytes = 0
-        for order in range(1, self.max_order + 1):
-            branch_count = (2 * self._n_drives) ** order
-            term_bytes += branch_count * (
-                self._n_drives * np.dtype(np.int_).itemsize
-                + n_subpixels * np.dtype(np.complex128).itemsize
-            )
-        return term_bytes
+        monomial_count = sum(
+            comb(order + 2 * self._n_drives - 1, 2 * self._n_drives - 1)
+            for order in range(1, self.max_order + 1)
+        )
+        return monomial_count * n_subpixels * np.dtype(np.complex128).itemsize
 
     def prepare_envelope(self, amplitudes: ArrayLike, dt: float) -> PreparedDysolveEnvelope:
-        """Prepare reusable t0-independent envelope branch weights."""
+        """Prepare reusable t0-independent control monomials."""
         return PreparedDysolveEnvelope(self, amplitudes, dt)
 
     def envelope_propagator_vjp(
@@ -1174,19 +1225,10 @@ class DysolvePropagator:
         Computes a batch of subpropagators.
         """
         current_times = np.asarray(current_times, dtype=float)
-        Sns = self._compute_Sns(dt)
-        length = len(self._eigenenergies)
-
-        subpropagators = np.broadcast_to(
-            Sns[0], (len(current_times), length, length)
-        ).astype(np.complex128, copy=True)
-
-        for n in range(1, self.max_order + 1):
-            omega_sums = self._get_omega_sums(n)
-            phases = np.exp(1j * np.outer(current_times, omega_sums))
-            subpropagators += np.tensordot(phases, Sns[n], axes=(1, 0))
-
-        return subpropagators
+        amplitudes = np.ones(
+            (self._n_drives, len(current_times)), dtype=np.complex128
+        )
+        return self._compute_control_subprops(amplitudes, current_times, dt)
 
     def _compute_subprop(self, current_time: float, dt: float) -> ArrayLike:
         """
