@@ -2,6 +2,7 @@
 #cython: boundscheck=False, wraparound=False, initializedcheck=False, cdivision=True
 import numpy as np
 cimport cython
+from libc.stdint cimport int64_t
 
 cdef extern from "<complex>" namespace "std" nogil:
     double complex exp(double complex x)
@@ -204,10 +205,10 @@ cdef double complex _compute_moment_integral(
     )
     cdef double complex[:, :] current_polynomials = current_polynomials_arr
     cdef double complex[:, :] next_polynomials = next_polynomials_arr
-    cdef object current_degrees_arr = np.zeros(order + 1, dtype=np.int_)
-    cdef object next_degrees_arr = np.zeros(order + 1, dtype=np.int_)
-    cdef long[:] current_degrees = current_degrees_arr
-    cdef long[:] next_degrees = next_degrees_arr
+    cdef object current_degrees_arr = np.zeros(order + 1, dtype=np.int64)
+    cdef object next_degrees_arr = np.zeros(order + 1, dtype=np.int64)
+    cdef int64_t[:] current_degrees = current_degrees_arr
+    cdef int64_t[:] next_degrees = next_degrees_arr
 
     for scaled_frequency_index in range(order):
         combined_frequency = abs(
@@ -321,7 +322,7 @@ cdef double complex _compute_moment_integral(
 
 cpdef object cy_compute_Sn(
     double[:, :] omega_vectors,
-    long[:, :] ket_bra_idx,
+    int64_t[:, :] ket_bra_idx,
     double[:, :] diff_lambdas,
     double complex[:] matrix_elements,
     double dt,
@@ -339,7 +340,7 @@ cpdef object cy_compute_Sn(
     cdef Py_ssize_t n_paths = diff_lambdas.shape[0]
     cdef Py_ssize_t order = omega_vectors.shape[1]
     cdef Py_ssize_t i, j, k
-    cdef long row, col
+    cdef int64_t row, col
     cdef object Sn_arr = np.zeros(
         (n_omega, length, length), dtype=np.complex128
     )
@@ -362,7 +363,7 @@ cpdef object cy_compute_Sn(
 
 cpdef object cy_compute_Sn_frequency_derivative_subsets(
     double[:, :] omega_vectors,
-    long[:, :] ket_bra_idx,
+    int64_t[:, :] ket_bra_idx,
     double[:, :] diff_lambdas,
     double complex[:] matrix_elements,
     double dt,
@@ -376,15 +377,15 @@ cpdef object cy_compute_Sn_frequency_derivative_subsets(
     cdef Py_ssize_t subset_count = 1 << order
     cdef Py_ssize_t omega_index, path_index, frequency_index, subset
     cdef Py_ssize_t derivative_count
-    cdef long row, col
+    cdef int64_t row, col
     cdef object output_arr = np.zeros(
         (n_omega, subset_count, length, length), dtype=np.complex128
     )
     cdef double complex[:, :, :, :] output = output_arr
     cdef object frequencies_arr = np.empty(order, dtype=float)
     cdef double[:] frequencies = frequencies_arr
-    cdef object derivative_positions_arr = np.empty(order, dtype=np.int_)
-    cdef long[:] derivative_positions = derivative_positions_arr
+    cdef object derivative_positions_arr = np.empty(order, dtype=np.int64)
+    cdef int64_t[:] derivative_positions = derivative_positions_arr
     cdef double complex derivative
 
     for omega_index in range(n_omega):
@@ -420,7 +421,7 @@ cpdef object cy_compute_Sn_frequency_derivative_subsets(
 
 cpdef object cy_compute_Sn_frequency_derivatives(
     double[:, :] omega_vectors,
-    long[:, :] ket_bra_idx,
+    int64_t[:, :] ket_bra_idx,
     double[:, :] diff_lambdas,
     double complex[:] matrix_elements,
     double dt,
@@ -432,7 +433,7 @@ cpdef object cy_compute_Sn_frequency_derivatives(
     cdef Py_ssize_t n_paths = diff_lambdas.shape[0]
     cdef Py_ssize_t order = omega_vectors.shape[1]
     cdef Py_ssize_t omega_index, path_index, frequency_index
-    cdef long row, col
+    cdef int64_t row, col
     cdef object output_arr = np.zeros(
         (n_omega, order, length, length), dtype=np.complex128
     )
