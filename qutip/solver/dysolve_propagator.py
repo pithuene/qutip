@@ -984,7 +984,7 @@ class DysolvePropagator:
 
                 Sn_group = cy_compute_Sn(
                     np.ascontiguousarray(omega_vectors[mask], dtype=float),
-                    np.ascontiguousarray(ket_bra_idx, dtype=np.int_),
+                    np.ascontiguousarray(ket_bra_idx, dtype=np.int64),
                     np.ascontiguousarray(diff_lambdas, dtype=float),
                     np.ascontiguousarray(matrix_elements, dtype=np.complex128),
                     dt,

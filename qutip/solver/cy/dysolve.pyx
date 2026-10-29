@@ -222,7 +222,7 @@ cpdef complex cy_compute_integrals(double[:] ws, double dt, double a_tol=1e-10):
 
 cpdef object cy_compute_Sn(
     double[:, :] omega_vectors,
-    long[:, :] ket_bra_idx,
+    int64_t[:, :] ket_bra_idx,
     double[:, :] diff_lambdas,
     double complex[:] matrix_elements,
     double dt,
@@ -239,7 +239,7 @@ cpdef object cy_compute_Sn(
     cdef Py_ssize_t n_paths = diff_lambdas.shape[0]
     cdef Py_ssize_t order = omega_vectors.shape[1]
     cdef Py_ssize_t i, j, k
-    cdef long row, col
+    cdef int64_t row, col
     cdef object Sn_arr = np.zeros(
         (n_omega, length, length), dtype=np.complex128
     )
