@@ -989,7 +989,6 @@ class DysolvePropagator:
                     np.ascontiguousarray(matrix_elements, dtype=np.complex128),
                     dt,
                     length,
-                    self.a_tol,
                 )
                 Sn_group *= (-1j / 2) ** n
                 Sn[mask] = exp_H_0 @ Sn_group

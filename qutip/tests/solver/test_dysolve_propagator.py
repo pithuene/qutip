@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+from scipy.linalg import expm
 from scipy.special import factorial
 
 from qutip import (
@@ -1080,6 +1081,69 @@ def test_integrals_2(eff_omega_1, eff_omega_2, dt):
     assert np.isclose(integrals, answer, rtol=1e-10, atol=1e-10)
 
 
+def _nested_integral_reference(ws, dt):
+    """Return the nested integral from the exponential of an Opitz matrix.
+
+    The ``[0, n]`` element of ``expm(diag(1j * x) + superdiagonal ones)`` is the
+    divided difference of ``exp`` at ``1j * x``. This is independent of the
+    recursion in ``cy_compute_integrals`` and normwise accurate.
+    """
+    ws = np.asarray(ws, dtype=float)
+    order = len(ws)
+    phases = np.concatenate(([0.0], np.cumsum(ws[::-1]) * dt))
+    opitz = np.diag(1j * phases) + np.diag(np.ones(order), 1)
+    return dt**order * expm(opitz)[0, -1]
+
+
+@pytest.mark.parametrize("ws, dt", [
+    # Near-resonant nuclear RF branches of an NV centre (rad/s and s).
+    ([30.0, 1.85e7, -1.85e7], 1e-12),
+    ([1.85e7, 30.0, -1.85e7], 1e-12),
+    ([1.85e7, -1.85e7, 30.0], 1e-12),
+    ([1e3, 2e3, 3e3], 1e-12),
+    ([1e-3, -2e-3, 5e-4, 1e-3, -1e-3, 2e-3], 1e-2),
+    # A fast electron branch next to slow nuclear branches.
+    ([8.8e9, 30.0, -1.85e7, 1.85e7], 1e-12),
+    ([8.8e9, 30.0, -1.85e7, 1.85e7], 1e-9),
+    ([8.8e9, -8.8e9 + 1e-3, 30.0, 2.0e7, -2.0e7, 4.0e3], 1e-9),
+])
+def test_integrals_are_accurate_for_small_phases(ws, dt):
+    # Integration by parts divides by each frequency and cancels
+    # catastrophically when frequency * dt is small.
+    order = len(ws)
+    integrals = cy_compute_integrals(np.array(ws, dtype=float), dt)
+
+    scale = abs(dt)**order / factorial(order)
+    assert abs(integrals - _nested_integral_reference(ws, dt)) <= 1e-10 * scale
+
+
+@pytest.mark.parametrize("max_order", [3, 4, 6])
+def test_near_resonant_slow_drive_is_unitary_at_small_steps(max_order):
+    # The resonant branch frequency times the step is about 1e-13, which
+    # made orders >= 3 non-unitary.
+    H_0 = 0.5 * sigmaz()
+    X = 0.05 * sigmax()
+    omega = 1 + 1e-9
+    t = 0.2
+    options = {"max_dt": 1e-4, "a_tol": 1e-14}
+    dysolve_U = DysolvePropagator(H_0, X, omega, {**options, "max_order": max_order})(t)
+    second_order_U = DysolvePropagator(H_0, X, omega, {**options, "max_order": 2})(t)
+
+    def coeff(t, omega):
+        return np.cos(omega * t)
+
+    qutip_U = propagator(
+        [H_0, [X, coeff]],
+        t,
+        args={"omega": omega},
+        options={"atol": 1e-12, "rtol": 1e-12},
+    )
+    U = _qobj_data(dysolve_U)
+    np.testing.assert_allclose(U.conj().T @ U, np.eye(2), atol=1e-12)
+    np.testing.assert_allclose(U, _qobj_data(qutip_U), atol=1e-9)
+    np.testing.assert_allclose(U, _qobj_data(second_order_U), atol=1e-9)
+
+
 
 @pytest.mark.parametrize("H_0", [
     sigmaz(), sigmay(), sigmaz(), qeye(2), tensor(sigmax(), sigmaz()),
@@ -1118,31 +1182,6 @@ def test_zeroth_order_shorter_than_max_dt(t_i, t_f):
 
     with CoreOptions(atol=1e-10, rtol=1e-10):
         assert U == exp
-
-
-def test_integral_a_tol_option_is_used(monkeypatch):
-    seen_a_tols = []
-
-    def fake_compute_Sn(
-        omega_vectors, ket_bra_idx, diff_lambdas, matrix_elements,
-        dt, length, a_tol=1e-10
-    ):
-        seen_a_tols.append(a_tol)
-        return np.zeros((len(omega_vectors), length, length), dtype=complex)
-
-    monkeypatch.setitem(
-        DysolvePropagator._compute_Sns.__globals__,
-        "cy_compute_Sn",
-        fake_compute_Sn,
-    )
-    dysolve = DysolvePropagator(
-        sigmaz(), sigmax(), 1,
-        options={'max_order': 1, 'a_tol': 1e-4}
-    )
-    dysolve._compute_Sns(0.1)
-
-    assert seen_a_tols
-    assert set(seen_a_tols) == {1e-4}
 
 
 @pytest.mark.parametrize("H_0", [sigmax(), sigmay(), sigmaz()])

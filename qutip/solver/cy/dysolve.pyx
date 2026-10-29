@@ -7,14 +7,25 @@ cdef extern from "<complex>" namespace "std" nogil:
     double complex exp(double complex x)
     double complex complex_conjugate "conj"(double complex x)
 
-np_fact = np.zeros(21, dtype=float)
+# Largest supported Dyson order. One order adds one node to the divided difference.
+cdef enum:
+    MAX_INTEGRAL_ORDER = 20
+    MAX_TAYLOR_TERMS = 40
+
+np_fact = np.zeros(MAX_INTEGRAL_ORDER + MAX_TAYLOR_TERMS + 2, dtype=float)
 cdef double[:] inv_factorial = np_fact
 cdef Py_ssize_t factorial_index
 inv_factorial[0] = 1
-for factorial_index in range(1, 21):
+for factorial_index in range(1, np_fact.shape[0]):
     inv_factorial[factorial_index] = (
         inv_factorial[factorial_index - 1] / factorial_index
     )
+
+# Nodes closer than this (in units of phase) are evaluated by a Taylor series
+# instead of the divided-difference recursion, which would divide by their
+# separation and amplify rounding errors.
+cdef double CLUSTER_PHASE_SPREAD = 1.0
+cdef double TAYLOR_RELATIVE_TOLERANCE = 1e-17
 
 
 cdef inline double complex _integer_power(
@@ -86,6 +97,95 @@ cdef void _matrix_multiply(
             output[row, column] = value
 
 
+cdef double complex _clustered_exponential_divided_difference(
+    const double* phases,
+    Py_ssize_t node_count,
+) noexcept nogil:
+    """Divided difference of ``exp(1j * x)`` at nearby real phases.
+
+    Around the cluster midpoint ``c``, ``exp[i x_0, ..., i x_k]`` equals
+    ``exp(i c) * sum_m h_m(i (x - c)) / (m + k)!``, where ``h_m`` is the
+    complete homogeneous symmetric polynomial. No term divides by a node
+    separation, so coincident and nearly coincident nodes are exact.
+    """
+    cdef Py_ssize_t k = node_count - 1
+    cdef double center = 0.5 * (phases[0] + phases[k])
+    cdef double radius = 0.5 * (phases[k] - phases[0])
+    cdef double complex homogeneous[MAX_TAYLOR_TERMS + 1]
+    cdef double complex shifted, total
+    cdef double term_bound = 1.0
+    cdef Py_ssize_t term_count = 0
+    cdef Py_ssize_t m, node
+
+    # |h_m| / (m + k)! <= radius**m / (m! k!), so stop once that bound is negligible.
+    while term_count < MAX_TAYLOR_TERMS and term_bound > TAYLOR_RELATIVE_TOLERANCE:
+        term_count += 1
+        term_bound *= radius / term_count
+    homogeneous[0] = 1.0
+    for m in range(1, term_count + 1):
+        homogeneous[m] = 0.0
+    for node in range(node_count):
+        shifted = 1j * (phases[node] - center)
+        for m in range(1, term_count + 1):
+            homogeneous[m] += shifted * homogeneous[m - 1]
+    total = 0.0
+    for m in range(term_count, -1, -1):
+        total += homogeneous[m] * inv_factorial[m + k]
+    return exp(1j * center) * total
+
+
+cdef double complex _nested_exponential_integral(
+    const double* ws,
+    Py_ssize_t order,
+    double dt,
+) noexcept nogil:
+    """Time-ordered integral of ``exp(1j * sum_k ws[k] * t_k)`` over ``[0, dt]``.
+
+    ``ws[0]`` belongs to the rightmost (innermost) integral. The integral equals
+    ``dt**order`` times the divided difference of ``exp(1j * x)`` at the phases
+    ``0, ws[-1] dt, (ws[-1] + ws[-2]) dt, ..., sum(ws) dt``. The table is built
+    from sorted phases, so every recursion step divides by the spread of its
+    nodes. Spreads below ``CLUSTER_PHASE_SPREAD`` use a Taylor series instead.
+    This stays accurate when a branch frequency times ``dt`` is tiny, which
+    happens for near-resonant low-frequency drives.
+    """
+    cdef double phases[MAX_INTEGRAL_ORDER + 1]
+    cdef double complex table[MAX_INTEGRAL_ORDER + 1]
+    cdef double phase
+    cdef Py_ssize_t node, level, i, j
+
+    phases[0] = 0.0
+    for node in range(1, order + 1):
+        phases[node] = phases[node - 1] + ws[order - node] * dt
+    # Insertion sort, the node count is at most MAX_INTEGRAL_ORDER + 1.
+    for i in range(1, order + 1):
+        phase = phases[i]
+        j = i - 1
+        while j >= 0 and phases[j] > phase:
+            phases[j + 1] = phases[j]
+            j -= 1
+        phases[j + 1] = phase
+
+    if phases[order] - phases[0] < CLUSTER_PHASE_SPREAD:
+        return dt ** order * _clustered_exponential_divided_difference(
+            phases, order + 1
+        )
+    for node in range(order + 1):
+        table[node] = exp(1j * phases[node])
+    # After level ``level``, table[i] holds exp[i x_i, ..., i x_{i + level}].
+    for level in range(1, order + 1):
+        for i in range(order + 1 - level):
+            if phases[i + level] - phases[i] < CLUSTER_PHASE_SPREAD:
+                table[i] = _clustered_exponential_divided_difference(
+                    &phases[i], level + 1
+                )
+            else:
+                table[i] = (table[i + 1] - table[i]) / (
+                    1j * (phases[i + level] - phases[i])
+                )
+    return dt ** order * table[0]
+
+
 cpdef complex cy_compute_integrals(double[:] ws, double dt, double a_tol=1e-10):
     """
         Computes the value of the nested integrals for a given array of
@@ -101,35 +201,23 @@ cpdef complex cy_compute_integrals(double[:] ws, double dt, double a_tol=1e-10):
             The time increment.
 
         a_tol : double, default = 1e-10
-            The absolute tolerance used.
+            Unused. Zero and nearly zero omegas need no special treatment.
 
         Returns
         -------
         value : complex
             The value of the nested integrals.
-
-        Notes
-        -----
-        Integrals are done analytically from right to left with integration
-        by parts.
-
     """
-    cdef double[:] ws_prime
-    if len(ws) == 1:
-        if abs(ws[0]) < a_tol:
-            return dt
-        else:
-            return (-1.j / ws[0]) * (exp(1j * ws[0] * dt) - 1.)
-    else:
-        if abs(ws[0]) < a_tol:
-            return cy_compute_tn_integrals(ws[1:], 1, dt)
-        else:
-            ws_prime = ws[1:].copy()
-            ws_prime[0] += ws[0]
-            return (-1j / ws[0]) * (
-                cy_compute_integrals(ws_prime, dt)
-                - cy_compute_integrals(ws[1:], dt)
-            )
+    cdef double contiguous_ws[MAX_INTEGRAL_ORDER]
+    cdef Py_ssize_t k
+    if not 1 <= ws.shape[0] <= MAX_INTEGRAL_ORDER:
+        raise ValueError(
+            f"Dyson order must be between 1 and {MAX_INTEGRAL_ORDER}, "
+            f"got {ws.shape[0]}"
+        )
+    for k in range(ws.shape[0]):
+        contiguous_ws[k] = ws[k]
+    return _nested_exponential_integral(contiguous_ws, ws.shape[0], dt)
 
 
 cpdef object cy_compute_Sn(
@@ -139,7 +227,6 @@ cpdef object cy_compute_Sn(
     double complex[:] matrix_elements,
     double dt,
     int length,
-    double a_tol=1e-10,
 ):
     """
         Accumulate one Dyson-order tensor before order prefactors.
@@ -157,8 +244,12 @@ cpdef object cy_compute_Sn(
         (n_omega, length, length), dtype=np.complex128
     )
     cdef double complex[:, :, :] Sn = Sn_arr
-    cdef object ws_arr = np.empty(order, dtype=float)
-    cdef double[:] ws = ws_arr
+    cdef double ws[MAX_INTEGRAL_ORDER]
+    if not 1 <= order <= MAX_INTEGRAL_ORDER:
+        raise ValueError(
+            f"Dyson order must be between 1 and {MAX_INTEGRAL_ORDER}, "
+            f"got {order}"
+        )
 
     for i in range(n_omega):
         for j in range(n_paths):
@@ -167,7 +258,7 @@ cpdef object cy_compute_Sn(
             row = ket_bra_idx[j, 0]
             col = ket_bra_idx[j, 1]
             Sn[i, row, col] += (
-                cy_compute_integrals(ws, dt, a_tol) * matrix_elements[j]
+                _nested_exponential_integral(ws, order, dt) * matrix_elements[j]
             )
 
     return Sn_arr
@@ -352,75 +443,3 @@ cpdef tuple cy_control_polynomial_vjp(
                     suffix[row, column] = next_suffix[row, column]
 
     return effective_cotangent_array, suffix_array
-
-
-cdef complex cy_compute_tn_integrals(
-    double[:] ws,
-    int n,
-    double dt,
-    double a_tol=1e-10,
-):
-    """
-        Helper function to compute nested integrals when the function to
-        integrate is t^n/factorial(n) * exp(1j*omega*t). This happens when
-        some effective omegas are 0. In that case, the recursion differs a
-        bit from _compute_integrals(). See eq. (7) in Ref.
-
-        Paramaters
-        ----------
-        ws : double[:]
-            An array of effective omegas. ws[0] is the omega for the rightmost
-            integral.
-
-        n : int
-            The variable in t^n/factorial(n).
-
-        dt : double
-            The time increment.
-
-        a_tol : double, default = 1e-10
-            The absolute tolerance used.
-
-        Returns
-        -------
-        value : complex
-            The value of the nested integrals when the function to integrate is
-            t^n/factorial(n) * exp(1j*omega*t).
-
-        Notes
-        -----
-        Integrals are done analytically from right to left with integration
-        by parts.
-
-    """
-    cdef complex factor, term1, term2
-    cdef double[:] ws_prime
-    cdef int j
-
-    if n == 0:
-        return cy_compute_integrals(ws, dt)
-
-    if n == 20:
-        # Max supported n, order of 1e-18
-        return 0.
-
-    if len(ws) == 1:
-        if abs(ws[0]) < a_tol:
-            return (dt ** (n + 1)) * inv_factorial[n + 1]
-        else:
-            factor = (-1j/ws[0]) * exp(1j*ws[0]*dt)
-            term1 = 0
-            for j in range(n+1):
-                term1 += ((1j/ws[0])**j) * (dt**(n-j) * inv_factorial[n-j])
-            term2 = (1j / ws[0])**(n+1)
-            return factor * term1 + term2
-    else:
-        if abs(ws[0]) < a_tol:
-            return cy_compute_tn_integrals(ws[1:], n + 1, dt)
-        else:
-            factor = -1j / ws[0]
-            ws_prime = ws[1:].copy()
-            ws_prime[0] += ws[0]
-            term1 = cy_compute_tn_integrals(ws_prime, n, dt)
-            term2 = cy_compute_tn_integrals(ws, n - 1, dt)
-            return factor * (term1 - term2)
