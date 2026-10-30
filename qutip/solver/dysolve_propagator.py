@@ -501,7 +501,17 @@ class DysolvePropagator:
             options.get('dt_key_decimals', 15) if options is not None else 15
         )
         self._dt_Sns = OrderedDict()
-        self._control_polynomials = {}
+        self._control_polynomials = OrderedDict()
+        self._doubling_pair_indices = None
+        # Largest phase rate of any branch integral: the eigenenergy spread plus
+        # max_order drive quanta. Below one radian of phase, every integral is
+        # one short Taylor series, which makes a direct build cheapest. Longer
+        # steps are built by doubling, see _double_control_polynomial.
+        self._max_phase_rate = float(
+            np.ptp(self._eigenenergies)
+            + self.max_order * np.max(np.abs(self._omegas))
+        )
+        self._direct_polynomial_max_phase = 1.0
         self._omega_vectors = {}
         self._branch_drive_indices = {}
         self._branch_signs = {}
@@ -787,6 +797,10 @@ class DysolvePropagator:
         Their ordered operator integrals remain distinct and are summed into
         one static matrix coefficient. This only reassociates the finite Dyson
         sum; it does not change its order, timestep, or counter-rotating terms.
+
+        Steps with large phases are built from two half steps, see
+        :meth:`_double_control_polynomial`, so only one short step per halving
+        chain needs the integrals of every branch and matrix-element path.
         """
         dt_key = self.canonical_time_step(dt)
         kernel_key = (self._kernel_signature, dt_key)
@@ -795,9 +809,34 @@ class DysolvePropagator:
             if shared_polynomial is not None:
                 return shared_polynomial
         elif dt_key in self._control_polynomials:
-            self._dt_Sns.move_to_end(dt_key)
+            self._control_polynomials.move_to_end(dt_key)
+            if dt_key in self._dt_Sns:
+                self._dt_Sns.move_to_end(dt_key)
             return self._control_polynomials[dt_key]
 
+        half_dt = dt_key / 2
+        if (
+            dt_key * self._max_phase_rate > self._direct_polynomial_max_phase
+            and self.canonical_time_step(half_dt) == half_dt
+        ):
+            polynomial = self._double_control_polynomial(
+                self._compute_control_polynomial(half_dt), half_dt
+            )
+        else:
+            polynomial = self._direct_control_polynomial(dt_key)
+        if self._kernel_cache is not None:
+            return self._kernel_cache._store_polynomial(
+                kernel_key,
+                polynomial,
+            )
+        if self.dt_cache_size > 0:
+            self._control_polynomials[dt_key] = polynomial
+            while len(self._control_polynomials) > self.dt_cache_size:
+                self._control_polynomials.popitem(last=False)
+        return polynomial
+
+    def _direct_control_polynomial(self, dt_key: float) -> _DysolveControlPolynomial:
+        """Collect the integrals of every branch and path into a control polynomial."""
         Sns = self._compute_Sns(dt_key)
         positive_counts = []
         negative_counts = []
@@ -836,7 +875,7 @@ class DysolvePropagator:
         negative_counts = np.asarray(negative_counts, dtype=np.int64).reshape(
             -1, self._n_drives
         )
-        polynomial = _DysolveControlPolynomial(
+        return _DysolveControlPolynomial(
             free_propagator=Sns[0],
             positive_counts=positive_counts,
             negative_counts=negative_counts,
@@ -845,14 +884,76 @@ class DysolvePropagator:
                 -1, length, length
             ),
         )
-        if self._kernel_cache is not None:
-            return self._kernel_cache._store_polynomial(
-                kernel_key,
-                polynomial,
+
+    def _double_control_polynomial(
+        self, polynomial: _DysolveControlPolynomial, dt: float
+    ) -> _DysolveControlPolynomial:
+        r"""Return the control polynomial of two consecutive steps ``dt``.
+
+        By Chen's identity, the Dyson terms of order ``n`` over ``[0, 2 dt]``
+        are the sums of products of terms of orders ``k`` over ``[dt, 2 dt]``
+        and ``n - k`` over ``[0, dt]``. So the series truncated at
+        ``max_order`` over ``2 dt`` is the product of the two half-step series,
+        truncated at ``max_order``, without further approximation. The later
+        half step sees its control amplitudes rotated by ``exp(-i omega dt)``,
+        which multiplies each monomial by ``exp(i dt charges @ omegas)``.
+        """
+        later, earlier, target = self._doubling_pairs(polynomial)
+        terms = np.concatenate(
+            (polynomial.free_propagator[None], polynomial.coefficients)
+        )
+        charges = np.vstack((
+            np.zeros((1, self._n_drives), dtype=np.int64),
+            polynomial.phase_charges,
+        ))
+        later_terms = terms * np.exp(1j * dt * (charges @ self._omegas))[
+            :, None, None
+        ]
+        combined = np.zeros_like(terms)
+        np.add.at(combined, target, later_terms[later] @ terms[earlier])
+        # The free propagator is diagonal, so it is computed exactly instead of
+        # squared, which would double its phase rounding with every doubling.
+        free_propagator = np.diag(
+            np.exp(-2j * dt * np.asarray(self._eigenenergies))
+        )
+        return polynomial._replace(
+            free_propagator=free_propagator,
+            coefficients=combined[1:],
+        )
+
+    def _doubling_pairs(
+        self, polynomial: _DysolveControlPolynomial
+    ) -> tuple[ArrayLike, ArrayLike, ArrayLike]:
+        """Monomial index pairs whose product stays within ``max_order``.
+
+        Index zero is the free propagator. Returns the later index, the earlier
+        index and the index of their product monomial.
+        """
+        if self._doubling_pair_indices is None:
+            counts = np.concatenate(
+                (polynomial.positive_counts, polynomial.negative_counts),
+                axis=1,
             )
-        if self.dt_cache_size > 0:
-            self._control_polynomials[dt_key] = polynomial
-        return polynomial
+            counts = np.vstack(
+                (np.zeros((1, counts.shape[1]), dtype=counts.dtype), counts)
+            )
+            index_by_counts = {
+                tuple(row): index for index, row in enumerate(counts)
+            }
+            later, earlier, target = [], [], []
+            for later_index, later_counts in enumerate(counts):
+                for earlier_index, earlier_counts in enumerate(counts):
+                    product_counts = later_counts + earlier_counts
+                    if product_counts.sum() <= self.max_order:
+                        later.append(later_index)
+                        earlier.append(earlier_index)
+                        target.append(index_by_counts[tuple(product_counts)])
+            self._doubling_pair_indices = (
+                np.asarray(later, dtype=np.intp),
+                np.asarray(earlier, dtype=np.intp),
+                np.asarray(target, dtype=np.intp),
+            )
+        return self._doubling_pair_indices
 
     @staticmethod
     def _control_monomial_factors(
@@ -960,8 +1061,9 @@ class DysolvePropagator:
         dt = dt_key
         Sns = {}
         length = len(self._eigenenergies)
-        exp_H_0 = (-1j*dt*self._H_0).expm().full()
         eigenenergies = np.asarray(self._eigenenergies)
+        # H_0 is diagonal in its eigenbasis, so its exponential is exact without expm.
+        exp_H_0 = np.diag(np.exp(-1j * dt * eigenenergies))
 
         Sns[0] = exp_H_0
 
@@ -998,8 +1100,7 @@ class DysolvePropagator:
         if self._kernel_cache is None and self.dt_cache_size > 0:
             self._dt_Sns[dt_key] = Sns
             while len(self._dt_Sns) > self.dt_cache_size:
-                evicted_dt, _ = self._dt_Sns.popitem(last=False)
-                self._control_polynomials.pop(evicted_dt, None)
+                self._dt_Sns.popitem(last=False)
         return Sns
 
     def _as_drive_amplitudes(self, amplitudes: ArrayLike) -> ArrayLike:

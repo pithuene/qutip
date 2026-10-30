@@ -423,6 +423,48 @@ def test_control_polynomial_cache_follows_timestep_tensor_lru():
     assert set(solver._control_polynomials) == {0.02, 0.03}
 
 
+def _two_drive_solver(max_order):
+    return DysolvePropagator.from_drives(
+        0.31 * sigmaz(),
+        [(0.19 * sigmax(), 1.3), (0.13 * sigmay(), 1.9)],
+        options={"max_order": max_order},
+    )
+
+
+@pytest.mark.parametrize("max_order", [1, 2, 4])
+def test_long_steps_double_shorter_control_polynomials(max_order):
+    solver = _two_drive_solver(max_order)
+    # The phase rate is 0.62 + max_order * 1.9, so 1.6 halves until a step's phase is below one radian.
+    base_dt = 0.1 if max_order == 4 else 0.2
+
+    doubled = solver._compute_control_polynomial(1.6)
+
+    assert tuple(solver._dt_Sns) == (base_dt,)
+    expected_steps = {1.6 / 2**halvings for halvings in range(round(np.log2(1.6 / base_dt)) + 1)}
+    assert set(solver._control_polynomials) == expected_steps
+    direct = solver._direct_control_polynomial(1.6)
+    np.testing.assert_array_equal(doubled.positive_counts, direct.positive_counts)
+    np.testing.assert_array_equal(doubled.negative_counts, direct.negative_counts)
+    np.testing.assert_allclose(
+        doubled.coefficients,
+        direct.coefficients,
+        rtol=0,
+        atol=1e-13 * np.abs(direct.coefficients).max(),
+    )
+    np.testing.assert_allclose(doubled.free_propagator, direct.free_propagator, rtol=0, atol=1e-15)
+
+
+def test_long_steps_without_an_exact_half_are_built_directly():
+    solver = _two_drive_solver(4)
+    # Halving this step changes it at the canonical 15-decimal precision.
+    dt = 0.123456789012345
+
+    solver._compute_control_polynomial(dt)
+
+    assert tuple(solver._dt_Sns) == (dt,)
+    assert tuple(solver._control_polynomials) == (dt,)
+
+
 def test_zero_timestep_tensor_cache_size_bypasses_storage():
     solver = DysolvePropagator(
         0.31 * sigmaz(),
