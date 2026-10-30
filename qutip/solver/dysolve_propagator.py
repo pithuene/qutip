@@ -503,10 +503,12 @@ class DysolvePropagator:
         self._dt_Sns = OrderedDict()
         self._control_polynomials = OrderedDict()
         self._doubling_pair_indices = None
-        # Largest phase rate of any branch integral: the eigenenergy spread plus
-        # max_order drive quanta. Below one radian of phase, every integral is
-        # one short Taylor series, which makes a direct build cheapest. Longer
-        # steps are built by doubling, see _double_control_polynomial.
+        self._lifted_register = None
+        # Bound on the diagonal of the lifted generator relative to the
+        # eigenenergy midpoint: the eigenenergy spread plus max_order drive
+        # quanta. Steps below one radian of phase are one short Taylor series,
+        # see _lifted_control_polynomial. Longer steps are built by doubling,
+        # see _double_control_polynomial.
         self._max_phase_rate = float(
             np.ptp(self._eigenenergies)
             + self.max_order * np.max(np.abs(self._omegas))
@@ -800,7 +802,7 @@ class DysolvePropagator:
 
         Steps with large phases are built from two half steps, see
         :meth:`_double_control_polynomial`, so only one short step per halving
-        chain needs the integrals of every branch and matrix-element path.
+        chain is built directly, see :meth:`_lifted_control_polynomial`.
         """
         dt_key = self.canonical_time_step(dt)
         kernel_key = (self._kernel_signature, dt_key)
@@ -810,13 +812,11 @@ class DysolvePropagator:
                 return shared_polynomial
         elif dt_key in self._control_polynomials:
             self._control_polynomials.move_to_end(dt_key)
-            if dt_key in self._dt_Sns:
-                self._dt_Sns.move_to_end(dt_key)
             return self._control_polynomials[dt_key]
 
         half_dt = dt_key / 2
         if (
-            dt_key * self._max_phase_rate > self._direct_polynomial_max_phase
+            abs(dt_key) * self._max_phase_rate > self._direct_polynomial_max_phase
             and self.canonical_time_step(half_dt) == half_dt
         ):
             polynomial = self._double_control_polynomial(
@@ -836,53 +836,124 @@ class DysolvePropagator:
         return polynomial
 
     def _direct_control_polynomial(self, dt_key: float) -> _DysolveControlPolynomial:
-        """Collect the integrals of every branch and path into a control polynomial."""
-        Sns = self._compute_Sns(dt_key)
-        positive_counts = []
-        negative_counts = []
-        coefficients = []
-        for order in range(1, self.max_order + 1):
-            drive_indices, signs, _ = self._get_branch_metadata(order)
-            branch_positive_counts = np.zeros(
-                (len(drive_indices), self._n_drives), dtype=np.int_
-            )
-            branch_negative_counts = np.zeros_like(branch_positive_counts)
-            for drive_index in range(self._n_drives):
-                drive_mask = drive_indices == drive_index
-                branch_positive_counts[:, drive_index] = np.sum(
-                    drive_mask & (signs > 0), axis=1
-                )
-                branch_negative_counts[:, drive_index] = np.sum(
-                    drive_mask & (signs < 0), axis=1
-                )
-            branch_counts = np.column_stack(
-                (branch_positive_counts, branch_negative_counts)
-            )
-            unique_counts, inverse = np.unique(
-                branch_counts, axis=0, return_inverse=True
-            )
-            for group_index, counts in enumerate(unique_counts):
-                positive_counts.append(counts[:self._n_drives])
-                negative_counts.append(counts[self._n_drives:])
-                coefficients.append(
-                    np.sum(Sns[order][inverse == group_index], axis=0)
-                )
+        """Build one step without the solver caches.
 
-        length = len(self._eigenenergies)
-        positive_counts = np.asarray(positive_counts, dtype=np.int64).reshape(
-            -1, self._n_drives
-        )
-        negative_counts = np.asarray(negative_counts, dtype=np.int64).reshape(
-            -1, self._n_drives
-        )
+        A step above the Taylor phase limit, whose halves are not canonical
+        time steps, is built from an uncached short step by repeated doubling.
+        """
+        doublings = 0
+        phase = abs(dt_key) * self._max_phase_rate
+        while phase / 2**doublings > self._direct_polynomial_max_phase:
+            doublings += 1
+        dt = dt_key / 2**doublings
+        polynomial = self._lifted_control_polynomial(dt)
+        for _ in range(doublings):
+            polynomial = self._double_control_polynomial(polynomial, dt)
+            dt *= 2
+        return polynomial
+
+    def _get_lifted_register(self) -> tuple:
+        """Count vectors of every control monomial and the generator edges between them.
+
+        Row zero is the free propagator. The remaining rows follow the order of
+        the ordered branch groups of :meth:`_compute_Sns`: by Dyson order, then
+        lexicographically by positive counts followed by negative counts.
+        Returns the counts, the carrier frequency offset of each row, and per
+        drive the source rows below ``max_order`` plus one ``(targets,
+        positions)`` pair per sign, where ``positions`` index those sources.
+        """
+        if self._lifted_register is not None:
+            return self._lifted_register
+        n_branches = 2 * self._n_drives
+        rows = [np.zeros(n_branches, dtype=np.int64)]
+        for order in range(1, self.max_order + 1):
+            rows.extend(
+                np.asarray(counts, dtype=np.int64)
+                for counts in itertools.product(range(order + 1), repeat=n_branches)
+                if sum(counts) == order
+            )
+        counts = np.asarray(rows, dtype=np.int64)
+        index_by_counts = {tuple(row): index for index, row in enumerate(counts)}
+        charges = counts[:, :self._n_drives] - counts[:, self._n_drives:]
+        sigmas = charges @ self._omegas
+        orders = counts.sum(axis=1)
+        sources = np.flatnonzero(orders < self.max_order)
+        position_by_source = {
+            int(source): position for position, source in enumerate(sources)
+        }
+        edges = []
+        for drive_index in range(self._n_drives):
+            sign_edges = []
+            for branch in (drive_index, drive_index + self._n_drives):
+                targets = np.flatnonzero(counts[:, branch] > 0)
+                lowered = counts[targets].copy()
+                lowered[:, branch] -= 1
+                positions = [
+                    position_by_source[index_by_counts[tuple(row)]]
+                    for row in lowered
+                ]
+                sign_edges.append((targets, np.asarray(positions, dtype=np.intp)))
+            edges.append(tuple(sign_edges))
+        half_drives = tuple(drive.full() / 2 for drive in self._Xs)
+        self._lifted_register = (counts, sigmas, sources, tuple(edges), half_drives)
+        return self._lifted_register
+
+    def _lifted_control_polynomial(self, dt: float) -> _DysolveControlPolynomial:
+        r"""Build all control coefficients of one short step at once.
+
+        Index the control monomials by their count vectors ``n`` and lift the
+        system into one block per monomial. The lifted generator ``G`` has
+        diagonal blocks ``H_0 + sigma_n``, with ``sigma_n = (charges @
+        omegas)_n``, and the half drive ``X_d / 2`` from every block ``n`` to
+        ``n`` plus one positive or negative quantum of drive ``d``. Its block
+        column ``[exp(-i G dt)]_{n, 0}``, times ``exp(i sigma_n dt)``, is the
+        sum of all ordered Dyson branches with counts ``n``, so it equals the
+        grouped ``Sns`` of :meth:`_compute_Sns`. Blocks above ``max_order``
+        are dropped, which truncates the Dyson series exactly at that order.
+
+        The exponential is a Taylor series about the eigenenergy midpoint.
+        Each term costs one matrix product per drive and block, instead of one
+        integral per ordered branch and matrix-element path. The caller keeps
+        the phase of the lifted diagonal below
+        ``_direct_polynomial_max_phase``, so the series has no cancellation.
+        """
+        counts, sigmas, sources, edges, half_drives = self._get_lifted_register()
+        energies = np.asarray(self._eigenenergies, dtype=float)
+        center = 0.5 * (energies.max() + energies.min())
+        diagonal = (energies - center)[None, :, None] + sigmas[:, None, None]
+        # A block of order n starts at Taylor term n. Every later term shrinks
+        # it by at least phase / k, so stop once that is below round-off.
+        phase = abs(dt) * float(np.max(np.abs(diagonal)))
+        tail_terms = 1
+        tail = phase
+        while tail > np.finfo(float).eps:
+            tail_terms += 1
+            tail *= phase / tail_terms
+        n_terms = self.max_order + tail_terms
+
+        length = len(energies)
+        term = np.zeros((len(counts), length, length), dtype=np.complex128)
+        term[0] = np.eye(length)
+        total = term.copy()
+        for k in range(1, n_terms + 1):
+            previous = term
+            term = diagonal * previous
+            for half_drive, sign_edges in zip(half_drives, edges):
+                driven = half_drive @ previous[sources]
+                for targets, positions in sign_edges:
+                    term[targets] += driven[positions]
+            term *= -1j * dt / k
+            total += term
+        total *= np.exp(1j * dt * (sigmas - center))[:, None, None]
+
+        positive_counts = counts[1:, :self._n_drives]
+        negative_counts = counts[1:, self._n_drives:]
         return _DysolveControlPolynomial(
-            free_propagator=Sns[0],
+            free_propagator=np.diag(np.exp(-1j * dt * energies)),
             positive_counts=positive_counts,
             negative_counts=negative_counts,
             phase_charges=positive_counts - negative_counts,
-            coefficients=np.asarray(coefficients, dtype=np.complex128).reshape(
-                -1, length, length
-            ),
+            coefficients=total[1:],
         )
 
     def _double_control_polynomial(
@@ -1041,6 +1112,11 @@ class DysolvePropagator:
         Computes Sns for each branch vector. This implements a similar equation
         to eq. (14) in Ref, but the function "f" is not used to avoid dealing
         explicitly with limits.
+
+        The cost grows with the number of matrix-element paths, as ``d**(n+1)``
+        at order ``n``. Propagation therefore builds control polynomials with
+        :meth:`_lifted_control_polynomial` and keeps this per-branch form as
+        an independent reference.
 
         Parameters
         ----------

@@ -403,7 +403,7 @@ def test_timestep_tensor_cache_evicts_by_lru_and_recomputes():
     assert len(solver._dt_Sns) <= 2
 
 
-def test_control_polynomial_cache_follows_timestep_tensor_lru():
+def test_control_polynomial_cache_evicts_by_lru_and_recomputes():
     solver = DysolvePropagator(
         0.31 * sigmaz(),
         0.19 * sigmax(),
@@ -416,11 +416,10 @@ def test_control_polynomial_cache_follows_timestep_tensor_lru():
     assert solver._compute_control_polynomial(0.01) is first
     solver._compute_control_polynomial(0.03)
 
-    assert tuple(solver._dt_Sns) == (0.01, 0.03)
-    assert set(solver._control_polynomials) == {0.01, 0.03}
+    assert tuple(solver._control_polynomials) == (0.01, 0.03)
     assert solver._compute_control_polynomial(0.02) is not second
-    assert tuple(solver._dt_Sns) == (0.03, 0.02)
-    assert set(solver._control_polynomials) == {0.02, 0.03}
+    assert tuple(solver._control_polynomials) == (0.03, 0.02)
+    assert not solver._dt_Sns
 
 
 def _two_drive_solver(max_order):
@@ -431,15 +430,107 @@ def _two_drive_solver(max_order):
     )
 
 
+def _path_control_polynomial(solver, dt):
+    """Group the per-branch Sns by control counts: the reference build."""
+    Sns = solver._compute_Sns(dt)
+    counts = []
+    coefficients = []
+    for order in range(1, solver.max_order + 1):
+        drive_indices, signs, _ = solver._get_branch_metadata(order)
+        branch_counts = np.column_stack(
+            [
+                np.sum((drive_indices == drive) & (signs > 0), axis=1)
+                for drive in range(solver._n_drives)
+            ]
+            + [
+                np.sum((drive_indices == drive) & (signs < 0), axis=1)
+                for drive in range(solver._n_drives)
+            ]
+        )
+        unique_counts, inverse = np.unique(
+            branch_counts, axis=0, return_inverse=True
+        )
+        for group, row in enumerate(unique_counts):
+            counts.append(row)
+            coefficients.append(
+                np.sum(Sns[order][inverse.ravel() == group], axis=0)
+            )
+    return np.asarray(counts), np.asarray(coefficients), Sns[0]
+
+
+def _degenerate_4x4_solver(max_order):
+    # Degenerate eigenenergies make many branch integrals take their limits.
+    return DysolvePropagator.from_drives(
+        tensor(sigmaz(), qeye(2)) + 0.4 * tensor(qeye(2), sigmaz()) + 0.6,
+        [
+            (0.3 * tensor(sigmax(), qeye(2)), 1.2),
+            (0.2 * tensor(qeye(2), sigmay()), 0.8),
+        ],
+        options={"max_order": max_order},
+    )
+
+
+@pytest.mark.parametrize(
+    "make_solver",
+    [
+        lambda: _two_drive_solver(4),
+        lambda: _degenerate_4x4_solver(3),
+        lambda: DysolvePropagator(
+            0.31 * sigmaz(), 0.19 * sigmax(), 1.3, options={"max_order": 6}
+        ),
+    ],
+    ids=["two_drives_order_4", "degenerate_4x4_order_3", "one_drive_order_6"],
+)
+@pytest.mark.parametrize("dt", [0.01, 0.1, -0.1, 0.123456789012345, 1.6, -2.3])
+def test_lifted_control_polynomial_matches_branch_integrals(make_solver, dt):
+    solver = make_solver()
+    counts, coefficients, free_propagator = _path_control_polynomial(solver, dt)
+
+    polynomial = solver._direct_control_polynomial(dt)
+
+    np.testing.assert_array_equal(
+        np.concatenate(
+            (polynomial.positive_counts, polynomial.negative_counts), axis=1
+        ),
+        counts,
+    )
+    np.testing.assert_array_equal(
+        polynomial.phase_charges,
+        polynomial.positive_counts - polynomial.negative_counts,
+    )
+    np.testing.assert_allclose(
+        polynomial.coefficients,
+        coefficients,
+        rtol=0,
+        atol=1e-14 * np.abs(coefficients).max(),
+    )
+    np.testing.assert_allclose(
+        polynomial.free_propagator, free_propagator, rtol=0, atol=1e-15
+    )
+
+
+def test_control_polynomials_do_not_enumerate_matrix_element_paths():
+    solver = _degenerate_4x4_solver(4)
+
+    solver._compute_control_polynomial(1.6)
+    solver._compute_control_polynomial(-0.123456789012345)
+
+    assert not solver._matrix_element_paths
+    assert not solver._dt_Sns
+
+
 @pytest.mark.parametrize("max_order", [1, 2, 4])
 def test_long_steps_double_shorter_control_polynomials(max_order):
     solver = _two_drive_solver(max_order)
-    # The phase rate is 0.62 + max_order * 1.9, so 1.6 halves until a step's phase is below one radian.
-    base_dt = 0.1 if max_order == 4 else 0.2
+    max_phase = solver._direct_polynomial_max_phase
 
     doubled = solver._compute_control_polynomial(1.6)
 
-    assert tuple(solver._dt_Sns) == (base_dt,)
+    # 1.6 halves until a step's phase is below the Taylor limit, and every
+    # step of the chain is cached.
+    base_dt = min(solver._control_polynomials)
+    assert base_dt * solver._max_phase_rate <= max_phase
+    assert 2 * base_dt * solver._max_phase_rate > max_phase
     expected_steps = {1.6 / 2**halvings for halvings in range(round(np.log2(1.6 / base_dt)) + 1)}
     assert set(solver._control_polynomials) == expected_steps
     direct = solver._direct_control_polynomial(1.6)
@@ -454,14 +545,14 @@ def test_long_steps_double_shorter_control_polynomials(max_order):
     np.testing.assert_allclose(doubled.free_propagator, direct.free_propagator, rtol=0, atol=1e-15)
 
 
-def test_long_steps_without_an_exact_half_are_built_directly():
+def test_long_steps_without_an_exact_half_cache_only_themselves():
     solver = _two_drive_solver(4)
     # Halving this step changes it at the canonical 15-decimal precision.
     dt = 0.123456789012345
 
     solver._compute_control_polynomial(dt)
 
-    assert tuple(solver._dt_Sns) == (dt,)
+    assert dt * solver._max_phase_rate > solver._direct_polynomial_max_phase
     assert tuple(solver._control_polynomials) == (dt,)
 
 
